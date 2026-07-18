@@ -1,514 +1,810 @@
 # NRX OTC Database Storage Flow Documentation
 
-This document provides a comprehensive, end-to-end technical reference for the data lifecycles, cross-service synchronization, and blockchain event processing layers across the NRX Over-the-Counter (OTC) platform services:
-*   `nrx-auth-service`
-*   `nrx-otc-backend`
-*   `nrx-otc-contract-backend`
+This document provides a comprehensive, end-to-end technical reference for the data lifecycles, cross-service synchronization, and blockchain event processing layers across the NRX OTC platform, structured by platform actors and mapped directly to database collections and schema keys.
 
 ---
 
 ## Master Persistence & CRUD Mappings (OTC Platform)
 
-The following master reference table maps every database operation described in the flows below, linking incoming client endpoints to MongoDB collection queries/updates, microservice boundaries, and blockchain events.
+The following master reference table maps every database operation, linking logical actor-based lifecycles to MongoDB collection queries/updates, database boundaries, and blockchain events.
 
-| Flow / Endpoint | Microservice Boundary | MongoDB Collection | CRUD Operation | Key Database Fields | Blockchain Event / Queue |
+| Actor | Flow / Lifecycle Step | Database Layer | MongoDB Collection | CRUD Operation | Key Database Fields | Blockchain Event / Queue |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Investor** | Investor Registration | Auth DB (Central) <br> OTC DB (Local) | `investors` (Auth) <br> `investors` (OTC) | Insert (Auth) <br> Upsert (OTC Sync) | Insert: `email`, `userName`, `password`, `globalId` <br> Sync: `globalId`, `userName`, `email`, `status` | None |
+| **Investor** | Investor Login & 2FA | Auth DB (Central) | `investors` | Read & Update | Read: `email`, `password`, `twoFaEnabled`, `twoFaSecret` \| Update: `tempToken`, `tempTokenExpiresAt` | None |
+| **Investor** | SIWE Wallet Connection | OTC DB (Local) <br> Auth DB (Central) | `investors` (OTC) <br> `investors` (Auth) | Update (OTC) <br> Update (Auth Sync) | OTC: `walletAddress`, unsets `walletNonce`, `walletNonceExpiresAt` <br> Auth: `walletAddress` mapped to `globalId` | None |
+| **Investor** | KYC Status Update | Auth DB (Central) | `investors` | Update | `KYCVerified`, `kycReviewedAt` | None |
+| **Investor** | Profile Settings Update | OTC DB (Local) | `investors` | Update | `phoneNumber`, `address`, `city`, `country`, `postalCode` | None |
+| **Investor** | Contact Support Request | OTC DB (Local) | `investorcontactsupports` | Insert | `investorId`, `name`, `email`, `subject`, `message`, `status` (pending) | None |
+| **Investor** | Account Deletion Request | OTC DB (Local) | `investordeleteds` | Insert | `investorId`, `email`, `reason`, `status` (pending) | None |
+| **Investor** | Investment Creation | OTC DB (Local) | `fundinginvestments` | Insert & Update | Insert: `investorId`, `fundId`, `totalAmount`, `investedAmount`, `subscriptionFee`, `status` (pending) \| Update: `documentUrl` | AWS S3 Upload (Mutual Agreement PDF) |
+| **Investor** | Investment Event (On-Chain) | OTC DB (Local) | `fundinginvestments` | Read & Update | Read: `walletAddress`, `status` (pending) \| Update: `investId` (stores on-chain tranche ID) | `InvestmentRequested` (Contract) |
+| **Investor** | Withdrawal Request | OTC DB (Local) | `fundinginvestments` <br> `investmentwithdrawalmethods` | Update (Investment) <br> Upsert (Method) | Investment: `withdrawalStatus` (requested) <br> Method: `investorId`, `fundId`, `investmentId`, `withdrawalMethod` (bank credentials encrypted) | None |
+| **Investor** | Airdrop Claiming | OTC DB (Local) | `successairdrops` <br> `airdrops` | Insert (Claim) <br> Update (Campaign) | Claim: `airdropId`, `investorId`, `walletAddress`, `amountClaimed`, `transactionHash` <br> Campaign: increments `totalClaimedAmount` | `AirdropClaimed` (Contract) |
+| **Investor** | Buy Tokens (Purchase) | OTC DB (Local) | `buytokens` | Insert | `investorId`, `fundId`, `amount`, `tokenQuantity`, `pricePerToken`, `status` (pending) | None |
+| **Investor** | Yield Claiming | OTC DB (Local) | `fundassetyieldmanagements` | Update | `status` (completed), `transactionHash` | None |
+| **Admin** | Admin Login & 2FA | OTC DB (Local) | `admins` | Read & Update | Read: `email`, `password`, `twoFactorEnabled`, `twoFactorSecret` \| Update: `lastLoginAt`, `jwtTokens` | None |
+| **Admin** | Admin Wallet Auth | OTC DB (Local) | `admins` | Read & Update | Read: `walletAddress`, `walletNonce`, `walletNonceExpiresAt` \| Update: `walletNonce` (nullified), `jwtTokens` | None |
+| **Admin** | Resolve Support Ticket | OTC DB (Local) | `investorcontactsupports` | Update | `status` (resolved), `adminNote`, `resolvedAt` | None |
+| **Admin** | Approve Account Deletion | OTC DB (Local) | `investordeleteds` <br> `investors` | Update (Request) <br> Update (Profile) | Request: `status` (deleted), `deletedAt` <br> Profile: `status` (0 / Suspended) | None |
+| **Admin** | Fund Creation | OTC DB (Local) | `fundmanagements` | Insert | Stored fields in `generalInformation`, `investmentStructure`, `feesAndCosts`, `smartContractReference`, `fundStatus` | None |
+| **Admin** | Investment Approval | OTC DB (Local) | `fundinginvestments` <br> `fundmanagements` | Update (Investment) <br> Update (Fund Metrics) | Investment: `status` (approved), `transactionHash`, `maturityTime`, `nextYieldClaimTime` <br> Fund: `fundedPercentage`, `remainingFundVolume`, `totalInvestedAmount`, `fundStatus` | `InvestmentMade` (Contract) |
+| **Admin** | Investment Rejection | OTC DB (Local) | `fundinginvestments` | Update | `status` (rejected), `rejectedReason` | `InvestmentRejected` (Contract) |
+| **Admin** | Airdrop Creation | OTC DB (Local) | `airdrops` | Insert | `title`, `description`, `totalAmount`, `tokenAddress`, `airdropStatus` (0 / Draft) | None |
+| **Admin** | Buy Tokens Approval | OTC DB (Local) | `buytokens` | Update | `status` (approved), `transactionHash` | None |
+| **Admin** | Yield Distribution Setup | OTC DB (Local) | `fundassetyieldmanagements` | Upsert | `fundId`, `investorId`, `yieldAmount`, `yieldPercentage`, `payoutDate`, `status` (pending) | None |
+| **Admin** | Site Settings Configuration | OTC DB (Local) | `site_settings` | Upsert | `maintenanceMode`, `allowedCountries`, `feeStructure`, `adminId` | None |
+| **Admin** | Block Checkpoint | OTC DB (Local) | `listenerblockcheckpoints` | Update ($max) | `blockNumber` (atomic monotonic update) | None |
+
+---
+
+## 1. Actor: Investor Flows
+
+### 1.1 Investor Registration & Synchronization
+When a new investor registers, their credentials and global identifiers are established centrally in the Auth DB before synchronizing downstream to the local OTC DB.
+
+#### Database Operations & State Lifecycle
+1. **Duplicate Account Check (Auth DB)**:
+   * **Database**: Central Identity Database
+   * **Collection**: `investors`
+   * **Operation**: Read (`findOne`)
+   * **Key Fields**:
+     * `email`: Checked to verify no existing account uses this login email.
+     * `userName`: Checked to verify the unique handle is free.
+2. **Central Account Insertion (Auth DB)**:
+   * **Database**: Central Identity Database
+   * **Collection**: `investors`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `email`: User login email.
+     * `userName`: Chosen username.
+     * `password`: Stored as a hashed string using `bcrypt`.
+     * `globalId`: Auto-generated UUID/ObjectId reference.
+     * `twoFaEnabled`: Hardcoded to `false` on registration.
+     * `status`: Hardcoded to `1` (Active).
+     * `registeredPlatform`: Stored as `"NRX-OTC"` to track origin.
+3. **Local Profile Downstream Sync (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `investors`
+   * **Operation**: Upsert (`findOneAndUpdate` with `{ upsert: true }`) matching the unique `globalId`
+   * **Key Fields Stored**:
+     * `globalId`: Links the local record directly to the Auth DB credentials.
+     * `email`: Synced from the Auth DB.
+     * `userName`: Synced from the Auth DB.
+     * `status`: Set to `1` (Active).
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Investor Login** (POST `/api/v1/investor/auth/login`) | Client -> OTC Backend -> Auth Service | `investors` (Auth DB) | Read | `email`, `passwordHash`, `tempToken`, `tempTokenExpiresAt`, `is2FAEnabled` | None |
-| **Verify Login 2FA** (POST `/api/v1/investor/auth/verify-2fa`) | Client -> OTC Backend -> Auth Service | `investors` (Auth DB) | Read & Update | Read: `tempToken` \| Update: `tempToken` (nullified) | None |
-| **Investor Registration** (POST `/api/v1/investor/auth/register`) | Client -> OTC Backend -> Auth Service | `investors` (Auth DB), `investors` (OTC DB) | Insert (Auth) / S2S Sync (OTC) | Insert: `email`, `userName`, `passwordHash`, `globalId` \| S2S: `globalId`, `userName`, `email` | None |
-| **SIWE Nonce** (POST `/api/v1/investor/wallet/nonce`) | Client -> OTC Backend | `investors` (OTC DB) | Update | `walletNonce`, `walletNonceExpiresAt` | None |
-| **SIWE Verification** (POST `/api/v1/investor/connect/wallet`) | Client -> OTC Backend -> Auth Service | `investors` (OTC DB), `investors` (Auth DB) | Update (OTC) / S2S Sync (Auth) | Update: `walletAddress` \| S2S: `walletAddress` synced to Auth Service | None |
-| **Sumsub KYC Webhook** (POST `/api/v1/admin/kyc/webhook`) | Sumsub -> OTC Backend -> Auth Service | `investors` (Auth DB) | Update | `kycStatus`, `kycReviewedAt` | None |
-| **Admin Login & 2FA** (POST `/api/v1/admin/login`) | Client -> OTC Backend | `admins` (OTC DB) | Read & Update | Read: `email`, `passwordHash`, `twoFASecret` \| Update: `lastLoginAt` | None |
-| **Admin Wallet Auth** (POST `/api/v1/admin/login/wallet`) | Client -> OTC Backend | `admins` (OTC DB) | Read & Update | Read: `walletAddress`, `walletNonce` \| Update: `walletNonce` (nullified) | None |
-| **OTC Investment Create** (POST `/api/v1/investor/investment/create`) | Client -> OTC Backend | `fundinginvestments` | Insert & Update | Insert: `investorId`, `fundId`, `investedAmount`, `status` (pending) | AWS S3 Upload (Mutual Agreement PDF) |
-| **OTC Investment Event** (`/fund-investment`) | Listener -> OTC Backend | `fundinginvestments` | Update | `investId` (stores on-chain tranche ID) | `InvestmentRequested` (Contract) |
-| **OTC Investment Approve** (`/investment/approve-reject`) | Listener -> OTC Backend | `fundinginvestments`, `fundmanagements` | Update (Investment) / Update (Fund) | Investment: `status` (approved), `transactionHash`, `maturityTime`, `nextYieldClaimTime` \| Fund: `fundedPercentage`, `remainingFundVolume` | `InvestmentMade` (Contract) |
-| **OTC Withdraw Request** (POST `/withdraw/:investmentId`) | Client -> OTC Backend | `fundinginvestments`, `investmentwithdrawalmethods` | Update (Investment) / Upsert (Method) | Investment: `withdrawalStatus` (requested) | None |
-| **Block Checkpoint** (`/block-checkpoint`) | Listener -> OTC Backend | `listenerblockcheckpoints` | Update ($max) | `blockNumber` (atomic monotonic update) | None |
+| **Auth DB** | `investors` | `email` | String | Insert / Read | Investor's unique identifier/email. |
+| **Auth DB** | `investors` | `userName` | String | Insert / Read | Unique display handle. |
+| **Auth DB** | `investors` | `password` | String | Insert | Bcrypt-hashed login credential. |
+| **Auth DB** | `investors` | `globalId` | UUID / String | Insert / Sync | Centralized ID linking all platform databases. |
+| **Auth DB** | `investors` | `twoFaEnabled` | Boolean | Insert | Set to `false` on initialization. |
+| **Auth DB** | `investors` | `status` | Number | Insert | Set to `1` (active) on initialization. |
+| **Auth DB** | `investors` | `registeredPlatform` | String | Insert | Set to `"NRX-OTC"`. |
+| **OTC DB** | `investors` | `globalId` | UUID / String | Upsert Match | Matches sync key. |
+| **OTC DB** | `investors` | `email` | String | Update | Copy of central login email. |
+| **OTC DB** | `investors` | `userName` | String | Update | Copy of central display handle. |
+| **OTC DB** | `investors` | `status` | Number | Update | Local status initialized to `1`. |
 
 ---
 
-## 1. Authentication & Sync Flows
+### 1.2 Investor Login & 2FA Flow
+Authenticating investor accounts, verifying passwords, and enforcing temporary Multi-Factor session states.
 
-### 1.1 Investor Login & JWT Handoff Flow
+#### Database Operations & State Lifecycle
+1. **Credentials Retrieval (Auth DB)**:
+   * **Database**: Central Identity Database
+   * **Collection**: `investors`
+   * **Operation**: Read (`findOne`) matching the submitted email.
+   * **Key Fields Read**:
+     * `email`: Query criteria.
+     * `password`: Fetched to verify against user input using bcrypt comparison.
+     * `twoFaEnabled`: Checked to verify if 2FA verification is required.
+2. **Temporary 2FA Session Creation (Auth DB - If 2FA is active)**:
+   * **Database**: Central Identity Database
+   * **Collection**: `investors`
+   * **Operation**: Update (`updateOne`)
+   * **Key Fields Updated**:
+     * `tempToken`: Writes a short-lived JSON Web Token string hash.
+     * `tempTokenExpiresAt`: Writes a timestamp defining the 10-minute expiry window.
+3. **2FA Verification (Auth DB - If 2FA is active)**:
+   * **Database**: Central Identity Database
+   * **Collection**: `investors`
+   * **Operation**: Read (`findOne`) matching the verification token.
+   * **Key Fields Read**:
+     * `tempToken`: Query criteria.
+     * `tempTokenExpiresAt`: Read to confirm the validation window is still active.
+     * `twoFaSecret`: Stored TOTP secret used to check the user's OTP code.
+4. **2FA Session Cleanup (Auth DB - If 2FA is active)**:
+   * **Database**: Central Identity Database
+   * **Collection**: `investors`
+   * **Operation**: Update (`updateOne`)
+   * **Key Fields Updated**:
+     * `tempToken`: `$unset` or set to `null` to disable reuse.
+     * `tempTokenExpiresAt`: `$unset` or set to `null` to clear.
 
-The OTC backend delegates credentials verification to the centralized `nrx-auth-service`.
-
-#### Data Flow & Mappings
-1. **Client API Request**: Client submits credentials to the OTC backend:
-   * **Endpoint**: `POST /api/v1/investor/auth/login` (Controller: `AuthInvestorController.login`)
-   * **DTO & Validation**: `LoginAuthInvestorDto` (fields: `email`, `password`).
-2. **S2S Proxy Call**: The OTC service routes the payload to `nrx-auth-service` via a secure HTTPS S2S POST request:
-   * **Auth Endpoint**: `POST /api/v1/investor/login` (Controller: `InvestorController.login`).
-3. **Database Read (Auth Service)**: 
-   * **Service**: `InvestorService.login`
-   * **MongoDB Operation**: `findOne` on `Investor` collection (in Auth DB) matching the verified `email`.
-   * **Credentials Verification**: Performs `bcrypt.compare` between input password and the stored `passwordHash`.
-4. **JWT & 2FA State Routing**:
-   * If **2FA is disabled**: Returns `sessionToken` (expires in 24 hours), `is2FARequired: false`, and the `Investor` document fields.
-   * If **2FA is enabled**: Generates a short-lived `tempToken` (JWT expiring in 10 minutes containing the investor's `globalId`), sets `is2FARequired: true`, and updates the database:
-     * **MongoDB Operation**: `updateOne` on the `Investor` collection.
-     * **Fields Updated**: `tempToken` (stored string hash) and `tempTokenExpiresAt`.
-5. **2FA Verification Endpoints (If 2FA is active)**:
-   * Client presents OTP and `tempToken` to the OTC backend, which proxies to `nrx-auth-service`:
-     * **Auth Endpoint**: `POST /api/v1/investor/verify-2fa` (Controller: `InvestorController.verify2FA`)
-     * **DTO**: `Verify2FAInvestorDto` (`tempToken`, `otpCode`).
-     * **MongoDB Operation**: `findOne` on `Investor` collection matching `tempToken` and checks that `tempTokenExpiresAt` > current time.
-     * **Verification**: Verifies OTP against the stored `twoFASecret` using `speakeasy.totp.verify`.
-     * **MongoDB Operation (Post-Verification)**: `updateOne` to nullify `tempToken` and `tempTokenExpiresAt` to prevent replay attacks.
-6. **Cookie Setting**: The OTC controller intercepts the returning `sessionToken` from Auth Service and writes it as an `HttpOnly`, `Secure`, `SameSite=Lax` cookie named `investor_session` directly to the client's express response header, while also issuing a CSRF token.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Investor as Client Browser
-    participant OTC as OTC Backend
-    participant Auth as Auth Service
-    participant DB as MongoDB (Auth DB)
-
-    Investor->>OTC: POST /auth/login (email, password)
-    OTC->>Auth: S2S Proxy: POST /api/v1/investor/login
-    Auth->>DB: findOne({ email })
-    DB-->>Auth: Investor Record (passwordHash, is2FAEnabled)
-    Note over Auth: bcrypt.compare(password, passwordHash)
-    alt 2FA is Enabled
-        Note over Auth: Generate tempToken (JWT, 10m expiry)
-        Auth->>DB: updateOne({ _id }, { $set: { tempToken, tempTokenExpiresAt } })
-        Auth-->>OTC: { is2FARequired: true, tempToken }
-        OTC-->>Investor: { is2FARequired: true, tempToken }
-        Investor->>OTC: POST /auth/verify-2fa (tempToken, otp)
-        OTC->>Auth: S2S Proxy: POST /api/v1/investor/verify-2fa
-        Auth->>DB: findOne({ tempToken })
-        DB-->>Auth: Investor Record (twoFASecret, tempTokenExpiresAt)
-        Note over Auth: speakeasy.totp.verify(otp, twoFASecret)
-        Auth->>DB: updateOne({ _id }, { $unset: { tempToken, tempTokenExpiresAt } })
-        Auth-->>OTC: { sessionToken }
-    else 2FA is Disabled
-        Note over Auth: Generate sessionToken (JWT, 24h expiry)
-        Auth-->>OTC: { sessionToken }
-    end
-    Note over OTC: Set HttpOnly Cookie (investor_session) & Issue CSRF
-    OTC-->>Investor: HTTP 200 OK (with Cookies & CSRF Header)
-```
-
----
-
-### 1.2 Investor Registration Flow
-
-Registration coordinates account creation across the central Identity database and local business database engine (OTC), maintaining schema segregation.
-
-#### Data Flow & Mappings
-1. **Client API Request**: Client submits registration details:
-   * **OTC Endpoint**: `POST /api/v1/investor/auth/register` (Controller: `AuthInvestorController.register`)
-   * **DTO**: `RegisterAuthInvestorDto` (fields: `email`, `userName`, `password`).
-2. **S2S Handoff**: OTC sends a secure POST to `nrx-auth-service`:
-   * **Auth Endpoint**: `POST /api/v1/investor/register` (Controller: `InvestorController.register`).
-3. **Database Insertion (Auth Service)**:
-   * **Service**: `InvestorService.register`
-   * **Duplicate Verification**: Executes `findOne` on `Investor` (Auth DB) to confirm neither `email` nor `userName` exists.
-   * **Password Hashing**: `bcrypt.hash` with salt rounds = 10.
-   * **MongoDB Operation**: `insertOne` on the `Investor` collection (Auth DB).
-   * **Fields Populated**: `email`, `userName`, `passwordHash`, `globalId` (auto-generated UUID), `is2FAEnabled: false`.
-4. **S2S Synchronous Downstream Propagation**:
-   * Auth Service broadcasts account generation to OTC service.
-   * **Propagation Call**: Signs an HMAC-SHA256 signature containing `globalId`, `userName`, and `email`, and sends a POST to:
-     * **OTC Sync API**: `POST /api/v1/listeners/sync-session`
-   * **Signature Verification**: Receivers calculate the HMAC using the local shared S2S secret (e.g., `S2S_NRX_OTC_KEY`) and check it against the incoming signature in the headers.
-   * **Local MongoDB Operation**: `findOneAndUpdate` with `{ globalId }` and `{ upsert: true }` on the local `Investor` collection.
-   * **Fields Populated**: `globalId`, `userName`, `email`.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Investor as Client Browser
-    participant OTC as OTC Backend
-    participant Auth as Auth Service
-    participant DB_Auth as Auth MongoDB
-    participant DB_Local as Local MongoDB (OTC)
-
-    Investor->>OTC: POST /auth/register (email, userName, password)
-    OTC->>Auth: S2S Proxy: POST /api/v1/investor/register
-    Auth->>DB_Auth: findOne({ $or: [{ email }, { userName }] })
-    DB_Auth-->>Auth: Null (No duplicates)
-    Note over Auth: Hash Password (bcrypt)
-    Auth->>DB_Auth: insertOne({ globalId, email, passwordHash, ... })
-    
-    Auth->>OTC: S2S Signed HMAC: POST /sync-session (globalId, email, userName)
-    Note over OTC: Verify HMAC Header
-    OTC->>DB_Local: findOneAndUpdate({ globalId }, { $set: { email, userName } }, { upsert: true })
-    
-    Auth-->>OTC: { success: true }
-    OTC-->>Investor: HTTP 201 Created
-```
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Auth DB** | `investors` | `email` | String | Read Match | Target matching login identifier. |
+| **Auth DB** | `investors` | `password` | String | Read | Stored bcrypt hash for verification. |
+| **Auth DB** | `investors` | `twoFaEnabled` | Boolean | Read | Checks if Multi-Factor is enforced. |
+| **Auth DB** | `investors` | `twoFaSecret` | String | Read | Enforces TOTP cryptographic checks. |
+| **Auth DB** | `investors` | `tempToken` | String | Update / Unset | Ephemeral validation session code. |
+| **Auth DB** | `investors` | `tempTokenExpiresAt`| Date | Update / Unset | Validation session timer. |
 
 ---
 
 ### 1.3 SIWE Wallet Connection Flow
+Validating ownership of decentralised addresses on the blockchain and syncing them back to central profile records.
 
-The platform relies on Sign-in with Ethereum (SIWE) to verify blockchain ownership, linking local investor profiles to decentralized wallet addresses.
+#### Database Operations & State Lifecycle
+1. **Nonce Initialization (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `investors`
+   * **Operation**: Update (`updateOne`) matching the investor's local `_id`.
+   * **Key Fields Updated**:
+     * `walletNonce`: Generates and writes a secure cryptographic nonce string.
+     * `walletNonceExpiresAt`: Writes an expiry timestamp (5-minute window).
+2. **Nonce Verification (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `investors`
+   * **Operation**: Read (`findOne`) matching investor `_id`.
+   * **Key Fields Read**:
+     * `walletNonce`: Compared against the signed message payload.
+     * `walletNonceExpiresAt`: Checked to ensure validation timeframe is active.
+3. **Local Wallet Registration (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `investors`
+   * **Operation**: Update (`updateOne`) matching investor `_id`.
+   * **Key Fields Updated**:
+     * `walletAddress`: Stores the normalized lowercase Ethereum address.
+     * `walletNonce`: `$unset` or cleared.
+     * `walletNonceExpiresAt`: `$unset` or cleared.
+4. **Central Wallet Synchronization (Auth DB)**:
+   * **Database**: Central Identity Database
+   * **Collection**: `investors`
+   * **Operation**: Update (`updateOne`) matching the `globalId`.
+   * **Key Fields Updated**:
+     * `walletAddress`: Syncs the Ethereum wallet address to the central record.
 
-#### Data Flow & Mappings
-1. **Nonce Generation**:
-   * **Endpoint**: `POST /api/v1/investor/wallet/nonce` (Controller: `AuthInvestorController.getWalletNonce`)
-   * **DTO**: `GetNonceInvestorDto` (`walletAddress`).
-   * **MongoDB Operation**: `updateOne` on the local `Investor` collection.
-   * **Fields Updated**: `walletNonce` (randomly generated cryptographically secure string) and `walletNonceExpiresAt` (expiry set to 5 minutes).
-   * **Return**: Nonce returned to the client.
-2. **Signature Verification & Connection**:
-   * **Endpoint**: `POST /api/v1/investor/connect/wallet` (Controller: `AuthInvestorController.connectWallet`)
-   * **DTO**: `LoginWalletInvestorDto` (fields: `walletAddress`, `message`, `signature`).
-   * **Validation (SIWE parser)**:
-     * Parses the SIWE message.
-     * Verifies the nonce in the message matches the stored `walletNonce` on the database.
-     * Confirms the domain/origin matches the platform's configuration limits (`SIWE_ALLOWED_DOMAINS`).
-     * Validates that the chain ID is allowlisted (`SIWE_ALLOWED_CHAIN_IDS`).
-     * Verifies signature authenticity using `ethers.verifyMessage` matching the public `walletAddress`.
-3. **Database Updates & Sync**:
-   * **Local MongoDB Operation**: `findOneAndUpdate` on local `Investor` collection matching investor `_id`.
-   * **Fields Updated**: Sets `walletAddress` (normalized to lowercase), clears `walletNonce` and `walletNonceExpiresAt`.
-   * **S2S Sync Call**: Invokes `nrx-auth-service` via secure HMAC-signed request:
-     * **Endpoint**: `POST /api/v1/investor/sync-wallet` (Controller: `InvestorController.internalSyncWallet`).
-     * **Auth MongoDB Operation**: `updateOne` on the central `Investor` collection.
-     * **Fields Updated**: `walletAddress` mapped to `globalId`.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Investor as Client Browser
-    participant OTC as OTC Backend
-    participant Auth as Auth Service
-    participant DB_Local as Local MongoDB (OTC)
-    participant DB_Auth as Auth MongoDB
-
-    Investor->>OTC: POST /wallet/nonce (walletAddress)
-    Note over OTC: Generate Cryptographic Nonce
-    OTC->>DB_Local: updateOne({ _id }, { walletNonce, walletNonceExpiresAt })
-    OTC-->>Investor: { nonce }
-    
-    Investor->>OTC: POST /connect/wallet (walletAddress, message, signature)
-    OTC->>DB_Local: findOne({ _id })
-    DB_Local-->>OTC: Investor (walletNonce, walletNonceExpiresAt)
-    Note over OTC: Verify Signature & SIWE message components
-    OTC->>DB_Local: updateOne({ _id }, { $set: { walletAddress }, $unset: { walletNonce, walletNonceExpiresAt } })
-    
-    OTC->>Auth: S2S Signed HMAC: POST /sync-wallet (globalId, walletAddress)
-    Auth->>DB_Auth: updateOne({ globalId }, { $set: { walletAddress } })
-    DB_Auth-->>Auth: Acknowledged
-    Auth-->>OTC: { status: true }
-    OTC-->>Investor: HTTP 200 OK (Wallet Linked)
-```
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `investors` | `walletNonce` | String | Update / Unset | Random string used for verification. |
+| **OTC DB** | `investors` | `walletNonceExpiresAt`| Date | Update / Unset | Expiration window for wallet connection. |
+| **OTC DB** | `investors` | `walletAddress` | String | Update | Confirmed lowercase Ethereum address. |
+| **Auth DB** | `investors` | `walletAddress` | String | Update | Synced lowercase address linked via `globalId`. |
 
 ---
 
-### 1.4 Sumsub KYC Webhook Flow
+### 1.4 KYC Verification Webhook
+Updates central verification logs when Sumsub returns approval or rejection.
 
-KYC verification status changes are pushed asynchronously by Sumsub via webhooks, parsed by the backends, and synced globally.
+#### Database Operations & State Lifecycle
+1. **KYC Verification Update (Auth DB)**:
+   * **Database**: Central Identity Database
+   * **Collection**: `investors`
+   * **Operation**: Update (`findOneAndUpdate`) matching the user's `globalId`.
+   * **Key Fields Updated**:
+     * `KYCVerified` (or `kycStatus`): Updated to:
+       * `1` (Approved) if the Sumsub hook returns `GREEN`.
+       * `2` (Rejected) if the Sumsub hook returns `RED`.
+     * `kycReviewedAt`: Updated to the current date and time.
 
-#### Data Flow & Mappings
-1. **External Webhook Trigger**: Sumsub triggers a verification response to the listener endpoint:
-   * **Endpoint**: `POST /api/v1/admin/kyc/webhook` (Controller: `SumsubWebhookController.handleWebhook`)
-2. **Local Processing**:
-   * **Service**: `AuthAdminService.updateKYCStatus`
-   * **Validation**: Extracts `reviewStatus` and `reviewResult.reviewAnswer`.
-   * **Status Code Mapping**:
-     * `GREEN` (Answer: `GREEN`) -> Internal code `1` (Approved)
-     * `RED` (Answer: `RED`) -> Internal code `2` (Rejected)
-3. **S2S Synchronization**:
-   * **Request**: OTC posts status change to Auth Service via HMAC-signed payload:
-     * **Endpoint**: `POST /api/v1/investor/sync-kyc`
-   * **Auth MongoDB Operation**: `findOneAndUpdate` matching the investor's `globalId`.
-   * **Fields Updated**: `kycStatus` (updated to `1` or `2`), `kycReviewedAt` (current timestamp).
-4. **Alerts & Notifications**:
-   * **Queue**: The local service sends a notification email to the investor (using `EmailHelper` or pushing to the redis `EmailQueueService`) notifying them of approval or rejection.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Sumsub as Sumsub Service
-    participant OTC as OTC Backend
-    participant Auth as Auth Service
-    participant DB_Auth as Auth MongoDB
-
-    Sumsub->>OTC: POST /kyc/webhook (applicantId, reviewAnswer, reviewStatus)
-    Note over OTC: Map reviewAnswer (GREEN -> 1, RED -> 2)
-    OTC->>Auth: S2S Signed HMAC: POST /sync-kyc (globalId, status)
-    Auth->>DB_Auth: findOneAndUpdate({ globalId }, { $set: { kycStatus, kycReviewedAt } })
-    DB_Auth-->>Auth: Updated Record
-    Auth-->>OTC: { success: true }
-    Note over OTC: Push KYC Status Notification to Email Queue
-    OTC-->>Sumsub: HTTP 200 OK
-```
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Auth DB** | `investors` | `globalId` | UUID / String | Read Match | Filters target profile. |
+| **Auth DB** | `investors` | `KYCVerified` | Number | Update | Verification status: `1` (Approved) or `2` (Rejected). |
+| **Auth DB** | `investors` | `kycReviewedAt` | Date | Update | Datetime KYC webhook processed. |
 
 ---
 
-## 2. Admin & Security Flows
+### 1.5 Profile Settings Update
+Allows investors to customize contact and geolocation data.
+
+#### Database Operations & State Lifecycle
+1. **Investor Contact Settings Update (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `investors`
+   * **Operation**: Update (`updateOne`) matching investor `_id`.
+   * **Key Fields Updated**:
+     * `phoneNumber`: User contact telephone string.
+     * `address`: Resident street address.
+     * `city`: Resident city.
+     * `country`: Resident country.
+     * `postalCode`: Resident area zip code.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `investors` | `phoneNumber` | String | Update | Investor's phone number. |
+| **OTC DB** | `investors` | `address` | String | Update | Resident street details. |
+| **OTC DB** | `investors` | `city` | String | Update | Geolocation city. |
+| **OTC DB** | `investors` | `country` | String | Update | Geolocation country. |
+| **OTC DB** | `investors` | `postalCode` | String | Update | Geolocation postal/zip code. |
+
+---
+
+### 1.6 Contact Support Request
+Allows investors to log troubleshooting issues directly with administrators.
+
+#### Database Operations & State Lifecycle
+1. **Support Ticket Registration (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `investorcontactsupports`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `investorId`: Reference link to local investor profile.
+     * `name`: Contact name.
+     * `email`: Contact email address.
+     * `subject`: Brief ticket subject.
+     * `message`: Detailed description of the issue.
+     * `status`: Set to `"pending"`.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `investorcontactsupports` | `investorId` | ObjectId | Insert | Linked profile identifier. |
+| **OTC DB** | `investorcontactsupports` | `name` | String | Insert | Customer name. |
+| **OTC DB** | `investorcontactsupports` | `email` | String | Insert | Customer notification email. |
+| **OTC DB** | `investorcontactsupports` | `subject` | String | Insert | Ticket subject line. |
+| **OTC DB** | `investorcontactsupports` | `message` | String | Insert | Detailed description. |
+| **OTC DB** | `investorcontactsupports` | `status` | String | Insert | Status initialized to `"pending"`. |
+
+---
+
+### 1.7 Account Deletion Request
+Ensures regulatory compliance by permitting investors to trigger soft-deletion queues.
+
+#### Database Operations & State Lifecycle
+1. **Compliance Deletion Entry (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `investordeleteds`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `investorId`: Reference link to local investor profile.
+     * `email`: Stored email address.
+     * `reason`: Explanation text provided by the investor.
+     * `status`: Set to `"pending"`.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `investordeleteds` | `investorId` | ObjectId | Insert | Linked profile identifier. |
+| **OTC DB** | `investordeleteds` | `email` | String | Insert | Account email to flag. |
+| **OTC DB** | `investordeleteds` | `reason` | String | Insert | Deletion reasoning statement. |
+| **OTC DB** | `investordeleteds` | `status` | String | Insert | Initialized status: `"pending"`. |
+
+---
+
+### 1.8 Investment Creation
+Initializes a private investment commitment pending Web3 on-chain confirmation.
+
+#### Database Operations & State Lifecycle
+1. **Fund Validation (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `fundmanagements`
+   * **Operation**: Read (`findById`)
+   * **Key Fields Read**:
+     * `_id` / `fundId`: Checked to confirm the fund is registered.
+     * `fundStatus`: Verified to ensure the status is `"On Going"`.
+2. **Investment Record Initialization (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `fundinginvestments`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `investorId`: Local investor profile ObjectId.
+     * `fundId`: Target fund management ObjectId.
+     * `totalAmount`: Gross investment volume (including fees).
+     * `investedAmount`: Net investment volume.
+     * `subscriptionFee`: Stored fee value.
+     * `status`: Hardcoded to `"pending"`.
+     * `documentType`: Hardcoded to `"investment-agreement"`.
+3. **Agreement Document Registration (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `fundinginvestments`
+   * **Operation**: Update (`updateOne`) matching the investment record.
+   * **Key Fields Updated**:
+     * `documentUrl`: Stores the AWS S3 link pointing to the PDF mutual agreement generated from HTML.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `fundmanagements` | `_id` | ObjectId | Read Match | Target fund identifier. |
+| **OTC DB** | `fundmanagements` | `fundStatus` | String | Read | Checks that fund is `"On Going"`. |
+| **OTC DB** | `fundinginvestments` | `investorId` | ObjectId | Insert | Linked investor identifier. |
+| **OTC DB** | `fundinginvestments` | `fundId` | ObjectId | Insert | Linked fund identifier. |
+| **OTC DB** | `fundinginvestments` | `totalAmount` | Number | Insert | Gross investment volume. |
+| **OTC DB** | `fundinginvestments` | `investedAmount` | Number | Insert | Net investment volume. |
+| **OTC DB** | `fundinginvestments` | `subscriptionFee` | Number | Insert | Charged fee metrics. |
+| **OTC DB** | `fundinginvestments` | `status` | String | Insert | Initialized status: `"pending"`. |
+| **OTC DB** | `fundinginvestments` | `documentType` | String | Insert | Set to `"investment-agreement"`. |
+| **OTC DB** | `fundinginvestments` | `documentUrl` | String | Update | PDF link hosted on S3. |
+
+---
+
+### 1.9 Investment Blockchain Event (`InvestmentRequested`)
+Links the Web2 pending commitment to the on-chain blockchain tranche after detecting the user's blockchain deposit.
+
+#### Database Operations & State Lifecycle
+1. **On-Chain Event Detection**:
+   * The stateless **`nrx-otc-contract-backend`** listens to the Sepolia blockchain.
+   * On detecting `InvestmentRequested`, it extracts `walletAddress`, `fundAddress`, and `investId` (tranche ID) and sends an HMAC-SHA256 callback to the core backend.
+2. **Pending Investment Record Match (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `fundinginvestments`
+   * **Operation**: Read (`findOne` matching target investor and fund).
+   * **Key Fields Read**:
+     * `investorId` & `fundId`: Matching queries.
+     * `status`: Must be `"pending"`.
+3. **On-Chain Identifier Registration (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `fundinginvestments`
+   * **Operation**: Update (`updateOne`)
+   * **Key Fields Updated**:
+     * `investId`: Set to the parsed on-chain numeric tranche ID.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `fundinginvestments` | `investorId` | ObjectId | Read Match | Matches target investor. |
+| **OTC DB** | `fundinginvestments` | `fundId` | ObjectId | Read Match | Matches target fund. |
+| **OTC DB** | `fundinginvestments` | `status` | String | Read Match | Confirms status is `"pending"`. |
+| **OTC DB** | `fundinginvestments` | `investId` | Number | Update | Sets the blockchain tranche ID. |
+
+---
+
+### 1.10 Withdrawal Request
+Allows investors to submit exit details for mature investments.
+
+#### Database Operations & State Lifecycle
+1. **Maturity Verification (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `fundinginvestments`
+   * **Operation**: Read & Update (`findOneAndUpdate`)
+   * **Key Fields Read**:
+     * `_id` (investmentId) and `investorId`: Query parameters.
+     * `status`: Verified to ensure it is `"approved"`.
+   * **Key Fields Updated**:
+     * `withdrawalStatus`: Updated to `"requested"`.
+2. **Payout Methods Registration (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `investmentwithdrawalmethods`
+   * **Operation**: Upsert (`findOneAndUpdate` with `{ upsert: true }`)
+   * **Key Fields Stored**:
+     * `investorId` / `fundId` / `investmentId`: Stored linking identifiers.
+     * `withdrawalMethod`: Stored method (`"nrx token"`, `"usdc"`, or `"euro"`).
+     * `bankName`, `iban`, `swift`, `accountNumber` (etc.): Hashed/encrypted banking details.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `fundinginvestments` | `status` | String | Read | Checked that investment status is `"approved"`. |
+| **OTC DB** | `fundinginvestments` | `withdrawalStatus`| String | Update | Updated to `"requested"`. |
+| **OTC DB** | `investmentwithdrawalmethods` | `investorId` | ObjectId | Upsert Match | Linked investor identity. |
+| **OTC DB** | `investmentwithdrawalmethods` | `fundId` | ObjectId | Upsert Match | Linked fund identity. |
+| **OTC DB** | `investmentwithdrawalmethods` | `investmentId` | ObjectId | Upsert Match | Linked investment identity. |
+| **OTC DB** | `investmentwithdrawalmethods` | `withdrawalMethod`| String | Insert / Update | Method chosen: `"nrx token"`, `"usdc"`, `"euro"`. |
+| **OTC DB** | `investmentwithdrawalmethods` | `bankName` | String | Insert / Update | Bank name credential (encrypted). |
+| **OTC DB** | `investmentwithdrawalmethods` | `iban` | String | Insert / Update | Bank IBAN credential (encrypted). |
+
+---
+
+### 1.11 Airdrop Claiming Flow
+Allows eligible investors to claim promotional tokens on-chain.
+
+#### Database Operations & State Lifecycle
+1. **Claim Verification (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `airdrops`
+   * **Operation**: Read (`findOne`) matching the active campaign.
+   * **Key Fields Read**:
+     * `airdropStatus`: Must equal `1` (Active).
+     * `totalAmount` & `totalClaimedAmount`: Checked to confirm remaining tokens are available.
+2. **Claim Record Log (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `successairdrops`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `airdropId`: Reference campaign ID.
+     * `investorId`: Claiming investor ObjectId.
+     * `walletAddress`: Linked claiming wallet.
+     * `amountClaimed`: Tokens retrieved.
+     * `transactionHash`: Stored on-chain claim payout hash.
+     * `claimedAt`: Current timestamp.
+3. **Airdrop Campaign Balance Update (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `airdrops`
+   * **Operation**: Update (`updateOne`)
+   * **Key Fields Updated**:
+     * `totalClaimedAmount`: Incremented by the claimed token amount.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `airdrops` | `airdropStatus` | Number | Read | Checks that campaign status is `1` (active). |
+| **OTC DB** | `airdrops` | `totalAmount` | Number | Read | Total pool cap. |
+| **OTC DB** | `airdrops` | `totalClaimedAmount`| Number | Read / Update | Increments on claims. |
+| **OTC DB** | `successairdrops` | `airdropId` | ObjectId | Insert | Associated campaign ID. |
+| **OTC DB** | `successairdrops` | `investorId` | ObjectId | Insert | Claiming investor. |
+| **OTC DB** | `successairdrops` | `walletAddress` | String | Insert | Receiving wallet address. |
+| **OTC DB** | `successairdrops` | `amountClaimed` | Number | Insert | Tokens distributed. |
+| **OTC DB** | `successairdrops` | `transactionHash` | String | Insert | Distribution tx hash. |
+
+---
+
+### 1.12 Buy Tokens (Purchase Request)
+Allows investors to buy platform utility tokens.
+
+#### Database Operations & State Lifecycle
+1. **Purchase Request Register (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `buytokens`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `investorId` / `fundId`: Reference IDs.
+     * `amount`: Fiat/USDC paid.
+     * `tokenQuantity`: Purchased count.
+     * `pricePerToken`: Stored unit price.
+     * `status`: Initialized to `"pending"`.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `buytokens` | `investorId` | ObjectId | Insert | Purchaser ID. |
+| **OTC DB** | `buytokens` | `fundId` | ObjectId | Insert | Reference fund ID. |
+| **OTC DB** | `buytokens` | `amount` | Number | Insert | Paid capital. |
+| **OTC DB** | `buytokens` | `tokenQuantity` | Number | Insert | Target token count. |
+| **OTC DB** | `buytokens` | `pricePerToken` | Number | Insert | Token price weight. |
+| **OTC DB** | `buytokens` | `status` | String | Insert | Set to `"pending"`. |
+
+---
+
+### 1.13 Yield Claiming Flow
+Retrieval of monthly yields.
+
+#### Database Operations & State Lifecycle
+1. **Yield Payout Update (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `fundassetyieldmanagements`
+   * **Operation**: Update (`updateOne`) matching the yield record.
+   * **Key Fields Updated**:
+     * `status`: Set to `"completed"`.
+     * `transactionHash`: Deployed smart contract payout hash.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `fundassetyieldmanagements` | `status` | String | Update | Transitions to `"completed"`. |
+| **OTC DB** | `fundassetyieldmanagements` | `transactionHash`| String | Update | On-chain claim verification hash. |
+
+---
+
+## 2. Actor: Admin Flows
 
 ### 2.1 Admin Login & 2FA Flow
+Administrators log into the backend panels via password validation combined with TOTP checks.
 
-Administrators access management features via standard password verification coupled with strict 2FA configurations.
+#### Database Operations & State Lifecycle
+1. **Credentials Validation (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `admins`
+   * **Operation**: Read (`findOne`) matching the email.
+   * **Key Fields Read**:
+     * `email`: Query criteria.
+     * `password`: Loaded to compare bcrypt hash.
+     * `twoFactorEnabled`: Checked to decide if 2FA verification is required.
+2. **TOTP Check (OTC DB - If 2FA active)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `admins`
+   * **Operation**: Read (`findById`).
+   * **Key Fields Read**:
+     * `twoFactorSecret`: Loaded to verify the submitted OTP code.
+3. **Session Registration (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `admins`
+   * **Operation**: Update (`updateOne`)
+   * **Key Fields Updated**:
+     * `lastLoginAt`: Updates to the current date and time.
+     * `jwtTokens`: Appends the newly issued session JWT to the active tokens array.
 
-#### Data Flow & Mappings
-1. **Client API Request**: Admin submits login payload:
-   * **Endpoint**: `POST /api/v1/admin/login` (Controller: `AuthAdminController.login`)
-   * **DTO**: `LoginAuthAdminDto` (`email`, `password`).
-2. **Database Verification (Local Business DB)**:
-   * **Service**: `AuthAdminService.login`
-   * **MongoDB Operation**: `findOne` on local `Admin` collection matching `email`.
-   * **Credentials Verification**: Executes `bcrypt.compare` against the stored `passwordHash`.
-3. **2FA State Routing**:
-   * If **2FA is enabled**: Generates short-lived `tempToken`, returns `is2FARequired: true`.
-   * If **2FA is disabled**: Returns `sessionToken` directly.
-4. **2FA OTP Code Submission**:
-   * **Endpoint**: `POST /api/v1/admin/verify-2fa` (Controller: `AuthAdminController.verify2FA`)
-   * **Payload**: `adminId`, `otp`.
-   * **MongoDB Operation**: `findById` on local `Admin` collection.
-   * **TOTP Verification**: Validates `otp` using `speakeasy.totp.verify` against `twoFASecret`.
-5. **Database Updates**:
-   * **MongoDB Operation**: `updateOne` on the `Admin` document.
-   * **Fields Updated**: Updates `lastLoginAt` timestamp.
-6. **Cookie Setting**: Controller calls `setAdminAuthCookie` and issues an admin CSRF token.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Admin as Admin Browser
-    participant OTC as OTC Backend
-    participant DB as MongoDB (OTC DB)
-
-    Admin->>OTC: POST /admin/login (email, password)
-    OTC->>DB: findOne({ email })
-    DB-->>OTC: Admin Record (passwordHash, is2FAEnabled)
-    Note over OTC: bcrypt.compare(password, passwordHash)
-    alt 2FA is Enabled
-        OTC-->>Admin: { is2FARequired: true, adminId }
-        Admin->>OTC: POST /admin/verify-2fa (adminId, otp)
-        OTC->>DB: findById(adminId)
-        DB-->>OTC: Admin Record (twoFASecret)
-        Note over OTC: speakeasy.totp.verify(otp, twoFASecret)
-    end
-    OTC->>DB: updateOne({ _id }, { $set: { lastLoginAt } })
-    Note over OTC: Set HttpOnly Cookie (admin_session) & Admin CSRF
-    OTC-->>Admin: HTTP 200 OK (with Cookies & CSRF Header)
-```
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `admins` | `email` | String | Read Match | Login identifier. |
+| **OTC DB** | `admins` | `password` | String | Read | Bcrypt hashed credential. |
+| **OTC DB** | `admins` | `twoFactorEnabled` | Boolean | Read | Checks 2FA status. |
+| **OTC DB** | `admins` | `twoFactorSecret` | String | Read | Checks TOTP secret token. |
+| **OTC DB** | `admins` | `lastLoginAt` | Date | Update | Timestamp of last access. |
+| **OTC DB** | `admins` | `jwtTokens` | Array | Update | Appends active session token. |
 
 ---
 
-### 2.2 Admin Wallet Authentication Flow
+### 2.2 Admin Wallet Authentication Flow (SIWE)
+Administrators link blockchain wallets and authenticate directly by signing messages.
 
-Administrators can link blockchain wallets to their profiles and authenticate securely using SIWE.
+#### Database Operations & State Lifecycle
+1. **Nonce Registration (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `admins`
+   * **Operation**: Update (`updateOne`).
+   * **Key Fields Updated**:
+     * `walletNonce`: Generates and stores the cryptographic nonce.
+     * `walletNonceExpiresAt`: Sets the expiry window.
+2. **SIWE Verification & Session Check (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `admins`
+   * **Operation**: Read & Update (`findOneAndUpdate`) matching `walletAddress` (normalized lowercase).
+   * **Key Fields Read**:
+     * `walletNonce`: Verified against the nonce parameter in the message payload.
+     * `walletNonceExpiresAt`: Verified to ensure the validation window is active.
+   * **Key Fields Updated**:
+     * `walletNonce`: `$unset` or cleared.
+     * `walletNonceExpiresAt`: `$unset` or cleared.
+     * `jwtTokens`: Appends the active session JWT.
 
-#### Data Flow & Mappings
-1. **Nonce Request**:
-   * **Endpoint**: `POST /api/v1/admin/wallet/nonce` (Controller: `AuthAdminController.getWalletNonce`)
-   * **DTO**: `GetNonceAdminDto` (`walletAddress`).
-   * **MongoDB Operation**: `updateOne` on the `Admin` collection.
-   * **Fields Updated**: Sets `walletNonce` and `walletNonceExpiresAt`.
-2. **Signature Verification & SIWE Verification**:
-   * **Endpoint**: `POST /api/v1/admin/login/wallet` (Controller: `AuthAdminController.loginWithWallet`)
-   * **DTO**: `LoginWalletAdminDto` (`walletAddress`, `message`, `signature`).
-   * **MongoDB Operation**: `findOne` matching `walletAddress` (normalized to lowercase).
-   * **Validation**: Extracts nonce from message, confirms it matches the stored `walletNonce` on DB, checks signature verification, and nullifies the nonce fields via `updateOne`.
-3. **Session Generation**: Issues the cookie `admin_session` and CSRF tokens.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Admin as Admin Browser
-    participant OTC as OTC Backend
-    participant DB as MongoDB (OTC DB)
-
-    Admin->>OTC: POST /admin/wallet/nonce (walletAddress)
-    Note over OTC: Generate Cryptographic Nonce
-    OTC->>DB: updateOne({ walletAddress }, { walletNonce, walletNonceExpiresAt })
-    OTC-->>Admin: { nonce }
-    
-    Admin->>OTC: POST /admin/login/wallet (walletAddress, message, signature)
-    OTC->>DB: findOne({ walletAddress })
-    DB-->>OTC: Admin Record (walletNonce, walletNonceExpiresAt)
-    Note over OTC: Verify SIWE parameters & Public Key Signature
-    OTC->>DB: updateOne({ _id }, { $unset: { walletNonce, walletNonceExpiresAt } })
-    Note over OTC: Set HttpOnly Cookie (admin_session) & Admin CSRF
-    OTC-->>Admin: HTTP 200 OK (Authenticated)
-```
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `admins` | `walletNonce` | String | Update / Unset | Cryptographic connection challenge nonce. |
+| **OTC DB** | `admins` | `walletNonceExpiresAt`| Date | Update / Unset | Nonce active lifetime. |
+| **OTC DB** | `admins` | `walletAddress` | String | Read Match | lowercase Ethereum address. |
+| **OTC DB** | `admins` | `jwtTokens` | Array | Update | Appends session token. |
 
 ---
 
-## 3. OTC Investment Lifecycle
+### 2.3 Resolve Support Ticket
+Allows administrators to manage, comment on, and resolve support logs.
 
-The OTC platform handles private debt/fund shares investments, starting with offline/Web2 signature commitments before locking assets on-chain.
+#### Database Operations & State Lifecycle
+1. **Support Ticket Resolution (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `investorcontactsupports`
+   * **Operation**: Update (`updateOne`) matching ticket `_id`.
+   * **Key Fields Updated**:
+     * `status`: Updated to `"resolved"`.
+     * `adminNote`: Notes detailing resolution steps.
+     * `resolvedAt`: Resolution timestamp.
 
-### 3.1 OTC Investment Lifecycle (Buy/Deposit)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Investor as Client Browser
-    participant OTC as OTC Backend
-    participant DB as MongoDB (OTC DB)
-    participant S3 as AWS S3 Storage
-    participant Listener as Listener Service
-    participant Contract as Smart Contract (EVM)
-
-    Investor->>OTC: POST /investment/create (fundId, investedAmount, signatureFile)
-    OTC->>DB: findById(fundId) (Validate Fund)
-    OTC->>DB: findById(investorId) (Validate Investor)
-    OTC->>DB: insertOne(FundingInvestment { status: "pending", investedAmount, ... })
-    Note over OTC: Generate Mutual Agreement HTML
-    OTC->>S3: Upload Investor Signature & Mutual Agreement HTML
-    S3-->>OTC: documentUrl (AWS Link)
-    OTC->>DB: updateOne({ investmentId }, { documentUrl })
-    OTC-->>Investor: HTTP 201 Created (Pending State)
-    
-    Note over Investor: Investor triggers web3 deposit transaction
-    Investor->>Contract: executeInvest(fundId, amount)
-    Note over Contract: Emit Event: InvestmentRequested(investor, amount, investmentId, fundId)
-    
-    Listener->>Contract: Detects InvestmentRequested
-    Listener->>OTC: POST /listeners/fund-investment (walletAddress, investId, fundId)
-    OTC->>DB: findOne({ walletAddress, status: "pending" })
-    OTC->>DB: updateOne({ investmentId }, { investId }) (Saves Tranche ID)
-    
-    Note over Contract: Admin approves transaction on-chain
-    Note over Contract: Emit Event: InvestmentMade(fundId, investor, investmentId, investedAmount, nextYieldClaimTime, maturityEndTime)
-    
-    Listener->>Contract: Detects InvestmentMade
-    Listener->>OTC: POST /listeners/investment/approve-reject (investId, transactionHash, maturityTime, ...)
-    OTC->>DB: findOne({ investId })
-    OTC->>DB: updateOne({ investmentId }, { status: "approved", transactionHash, maturityTime, nextYieldClaimTime })
-    Note over OTC: updateFundMetricsAfterInvestment()
-    OTC->>DB: updateOne(FundManagement { fundedPercentage, remainingFundVolume })
-    Note over OTC: Send Mutual Agreement PDF Email with S3 documentUrl
-```
-
-#### Detailed Operations & Mappings
-1. **Creation Endpoint**: 
-   * **Endpoint**: `POST /api/v1/investor/investment/create` (Controller: `InvestmentController.create`)
-   * **DTO**: `CreateInvestmentDto` (fields: `fundId`, `investedAmount`, `totalAmount`).
-   * **File Upload**: Signature image parsed by NestJS `FileInterceptor` and validated using `imageUploadInterceptorOptions`.
-2. **Database Verification**:
-   * Reads from `FundManagement` to confirm the fund exists.
-   * Reads from local `Investor` to confirm the investor profile exists.
-3. **Database Write**:
-   * **MongoDB Operation**: `insertOne` on the `fundinginvestments` collection.
-   * **Initial State**: `status` is hardcoded to `pending`, and `investedAmount` is set from the DTO.
-4. **Mutual Agreement Generation**:
-   * **Upload Signature**: Uploads the signature file to AWS S3 using `uploadImageToS3`.
-   * **HTML Render**: Renders the agreement using `renderTemplate('mutual-agreement')`, passing variables (e.g., investor name, fund entity, invested amount, and S3 signature link).
-   * **PDF Upload**: Uploads HTML output to S3 using `uploadHtmlToS3` returning `documentUrl`.
-   * **MongoDB Operation**: `updateOne` on the `fundinginvestments` record to save the `documentUrl`.
-   * **Initial Email Alerts**: Sends a confirmation email to the investor and an approval request email to the platform administrator.
-5. **Blockchain Interactions & Listening**:
-   * **Blockchain Event `InvestmentRequested`**: Emitted when the investor executes the deposit transaction on the blockchain. Contains: `investor` address, `amount`, `investmentId` (the on-chain tranche ID), and `fundId`.
-   * **Listener Action**: `InvestmentListener.handleInvestmentEvent` intercepts the event, pauses 10 seconds to avoid database conflict writes, and calls the API:
-     * **API Call**: `POST /api/v1/listeners/fund-investment` (Controller: `ListenerController.fundInvestment`)
-     * **DTO**: `FundInvestmentDto` (`walletAddress`, `investId`, `fundId`, `totalAmount`).
-     * **MongoDB Operation**: Searches `fundinginvestments` matching investor/fund/`status: pending` where `investId` is not yet defined, and updates the document.
-     * **Field Updated**: Sets `investId` to the on-chain `investmentId` value.
-   * **Blockchain Event `InvestmentMade`**: Emitted when the administrator approves the investment on-chain.
-   * **Listener Action**: `InvestmentListener.handleInvestmentApprovedEvent` intercepts the event and posts to:
-     * **API Call**: `POST /api/v1/listeners/investment/approve-reject` (Controller: `ListenerController.investmentApproveReject`)
-     * **DTO**: `InvestmentApproveRejectDto` (`investId`, `transactionHash`, `walletAddress`, `investedAmount`, `nextYieldClaimTime`, `maturityTime`).
-     * **MongoDB Operation**: Searches `fundinginvestments` by `investId` and updates status:
-       * **Fields Updated**: `status` -> `approved`, `transactionHash`, `maturityTime`, `nextYieldClaimTime` (array of claimable timestamps).
-     * **Metrics Updates**: Recalculates statistics via `updateFundMetricsAfterInvestment`:
-       * **MongoDB Operation**: `updateOne` on the associated `FundManagement` document, adjusting `fundedPercentage`, `remainingFundVolume`, and updating state to `Closing Soon` or `Closed` depending on limit thresholds.
-     * **Verification Email**: Sends a final transaction confirmation email to the investor containing the S3 agreement link (`documentUrl`).
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `investorcontactsupports` | `status` | String | Update | Transitions to `"resolved"`. |
+| **OTC DB** | `investorcontactsupports` | `adminNote` | String | Update | Admin text explanation notes. |
+| **OTC DB** | `investorcontactsupports` | `resolvedAt` | Date | Update | Resolved datetime log. |
 
 ---
 
-### 3.2 OTC Withdrawal Lifecycle
+### 2.4 Approve Account Deletion
+Allows administrators to process and authorize account deletion requests.
 
-Investors can request withdrawals, which are evaluated by the platform administrator and processed through smart contract calls.
+#### Database Operations & State Lifecycle
+1. **Compliance Request Update (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `investordeleteds`
+   * **Operation**: Update (`updateOne`) matching delete entry `_id`.
+   * **Key Fields Updated**:
+     * `status`: Set to `"deleted"`.
+     * `deletedAt`: Current timestamp.
+2. **Investor Account Suspension (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `investors`
+   * **Operation**: Update (`updateOne`) matching investor profile `globalId`.
+   * **Key Fields Updated**:
+     * `status`: Updated to `0` (Disabled/Suspended profile status).
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Investor as Client Browser
-    participant OTC as OTC Backend
-    participant DB as MongoDB (OTC DB)
-    participant Listener as Listener Service
-    participant Contract as Smart Contract (EVM)
-
-    Investor->>OTC: POST /investment/withdraw/:investmentId (walletAddress, withdrawalReason)
-    OTC->>DB: findOne({ _id: investmentId, investorId, status: "approved" })
-    OTC->>DB: updateOne({ investmentId }, { withdrawalStatus: "requested" })
-    OTC->>DB: findOneAndUpdate({ investmentId }, { $set: withdrawalDetails }, { upsert: true }) (Creates Withdrawal Method)
-    Note over OTC: Send Withdrawal Requested Email Alerts to Investor & Admins
-    OTC-->>Investor: HTTP 200 OK (Requested State)
-    
-    Note over Listener: Admin processes withdrawal on-chain
-    Note over Listener: Admin executes contract withdrawal approval or rejection
-    alt On-Chain Rejection
-        Note over Contract: Emit Event: InvestmentRejected(fundId, investor, investmentId, amount, reason)
-        Listener->>Contract: Detects InvestmentRejected
-        Listener->>OTC: POST /listeners/investment/approve-reject (investId, rejectedReason)
-        OTC->>DB: findOne({ investId })
-        OTC->>DB: updateOne({ investmentId }, { status: "rejected", rejectedReason })
-        Note over OTC: Send Investment Rejection Email to Investor
-    end
-```
-
-#### Detailed Operations & Mappings
-1. **Withdrawal Request**:
-   * **Endpoint**: `POST /api/v1/investor/investment/withdraw/:investmentId` (Controller: `InvestmentController.withdraw`)
-   * **DTO**: `WithdrawalInvestmentDto` (`walletAddress`, `bankName`, `iban`, `swiftCode`, `withdrawalMethod`).
-   * **MongoDB Operations**:
-     * Performs `findOne` on `fundinginvestments` matching the `investmentId`, `investorId`, and verified `status: approved`.
-     * Performs `updateOne` on the investment record, setting `withdrawalStatus` to `requested`.
-     * Performs `findOneAndUpdate` on the `investmentwithdrawalmethods` collection (using `{ upsert: true }`) to save bank details mapped to the investment.
-   * **Notification**: Dispatches notification emails immediately to the investor and the site administrator.
-2. **On-Chain Reject processing**:
-   * **Blockchain Event `InvestmentRejected`**: Triggered on-chain during manual administrative reject.
-   * **Listener Action**: `InvestmentListener.handleInvestmentRejectedEvent` intercepts and triggers:
-     * **API Call**: `POST /api/v1/listeners/investment/approve-reject`
-     * **MongoDB Operation**: `updateOne` on the `fundinginvestments` record.
-     * **Fields Updated**: `status` -> `rejected`, `rejectedReason` set to the on-chain string.
-     * **Notification**: Sends rejection notification email containing the reason.
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `investordeleteds` | `status` | String | Update | Transitions to `"deleted"`. |
+| **OTC DB** | `investordeleteds` | `deletedAt` | Date | Update | Processed timestamp. |
+| **OTC DB** | `investors` | `status` | Number | Update | Sets status to `0` (Disabled/Suspended). |
 
 ---
 
-## 4. Event Listening & Checkpoints
+### 2.5 Fund Creation
+Administrators seed and configure funds (OTC products) on the platform.
 
-### 4.1 OTC Blockchain Listener & Checkpoint Flow
+#### Database Operations & State Lifecycle
+1. **Fund Registry Creation (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `fundmanagements`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `generalInformation`: Subdocument containing `fundName`, `fundCategory`, `description`, `fundLaunchDate`, `fundCurrency`.
+     * `investmentStructure`: Subdocument containing `minimumInvestment`, `maximumInvestment`, `totalFundVolume`, `maturityPeriod`, `yieldType`.
+     * `feesAndCosts`: Subdocument containing `subscriptionFee`, `managementFee`, `administrativeCustodyFee`.
+     * `complianceAndGovernance`: Subdocument containing `regulatoryJurisdiction`, `governingLaw`.
+     * `smartContractReference`: Stored smart contract address.
+     * `fundedPercentage` & `totalInvestedAmount`: Defaulted to `0`.
+     * `fundStatus`: Defaulted to `"On Going"`.
+     * `remainingFundVolume`: Set to total fund volume.
 
-The OTC platform uses a stateless listener `nrx-otc-contract-backend` to monitor blockchain events, process them sequentially via `nrx-otc-backend`, and persist progress via checkpoints.
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `fundmanagements` | `generalInformation` | Object | Insert | Nested details (names, descriptions, currency, categories). |
+| **OTC DB** | `fundmanagements` | `investmentStructure` | Object | Insert | Volumes, limits, maturity times, yields. |
+| **OTC DB** | `fundmanagements` | `feesAndCosts` | Object | Insert | Management, subscription, and custody fees. |
+| **OTC DB** | `fundmanagements` | `smartContractReference`| String | Insert | Contract address deployed on-chain. |
+| **OTC DB** | `fundmanagements` | `fundedPercentage` | Number | Insert | default `0`. |
+| **OTC DB** | `fundmanagements` | `totalInvestedAmount`| Number | Insert | default `0`. |
+| **OTC DB** | `fundmanagements` | `fundStatus` | String | Insert | default `"On Going"`. |
+| **OTC DB** | `fundmanagements` | `remainingFundVolume`| Number | Insert | Initialized to total capacity volume. |
 
-```mermaid
-flowchart TD
-    subgraph EVM Chain
-        Event[Contract Event Emitted]
-    end
+---
 
-    subgraph Stateless OTC Contract Listener
-        Listen[BaseListener Service] -->|Intercepts Event| Parse[Extract eventData & blockNumber]
-        Parse -->|Sign HMAC Header| HTTPPost[HTTP POST API Call]
-    end
+### 2.6 Investment Approval (`InvestmentMade` event)
+Triggers when the administrator approves the investment tranche on-chain. The event is captured by the stateless contract backend listener and pushed to the core service to update records and fund statistics.
 
-    subgraph Core OTC Business Backend
-        HTTPPost -->|Arrives at Controller| CheckConflict{HTTP 200 or 500?}
-        
-        CheckConflict -->|500 Server Error| Queue[Durable Queue Service]
-        Queue -->|Enqueue MongoDB| QueueDB[(MongoDB Queue Collection)]
-        QueueDB -->|Cron Retries| HTTPPost
-        
-        CheckConflict -->|200 OK| Process[Execute Service logic & updates]
-        Process -->|Sync DB| CoreDB[(MongoDB Core Collections)]
-        
-        Process -->|Atomically Update Checkpoint| UpdateCheck[Update Checkpoint document]
-        UpdateCheck -->|$max: { blockNumber }| CheckpointDB[(listenerblockcheckpoints)]
-    end
+#### Database Operations & State Lifecycle
+1. **Investment State Transition (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `fundinginvestments`
+   * **Operation**: Update (`updateOne`) matching the unique on-chain `investId`.
+   * **Key Fields Updated**:
+     * `status`: Transitions from `"pending"` to `"approved"`.
+     * `transactionHash`: Stores the approval transaction hash.
+     * `maturityTime`: Set to the on-chain timestamp.
+     * `nextYieldClaimTime`: Set to the on-chain claim times array.
+2. **Fund Progress Recalculation (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `fundmanagements`
+   * **Operation**: Update (`updateOne`) matching the parent fund.
+   * **Key Fields Updated**:
+     * `fundedPercentage`: Recalculates and updates the funding completion ratio.
+     * `remainingFundVolume`: Reduced by the investment amount.
+     * `totalInvestedAmount`: Increased by the investment amount.
+     * `fundStatus`: Toggles to `"Closing Soon"` (> 70%) or `"Closed"` (100% capacity).
 
-    Event -.-> Listen
-```
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `fundinginvestments` | `status` | String | Update | Transitions to `"approved"`. |
+| **OTC DB** | `fundinginvestments` | `transactionHash`| String | Update | On-chain approval transaction hash. |
+| **OTC DB** | `fundinginvestments` | `maturityTime` | Number | Update | On-chain maturity epoch timestamp. |
+| **OTC DB** | `fundinginvestments` | `nextYieldClaimTime`| Array | Update | Future yield claims list (epochs). |
+| **OTC DB** | `fundmanagements` | `fundedPercentage` | Number | Update | Updated percentage ratio. |
+| **OTC DB** | `fundmanagements` | `remainingFundVolume`| Number | Update | Capacity reduced by purchase size. |
+| **OTC DB** | `fundmanagements` | `totalInvestedAmount`| Number | Update | Capital total increased. |
+| **OTC DB** | `fundmanagements` | `fundStatus` | String | Update | Set to `"Closing Soon"` or `"Closed"`. |
 
-#### Detailed Operations & Mappings
-1. **Stateless Event Processing**:
-   * The listener backend `nrx-otc-contract-backend` monitors EVM contract events.
-   * It extracts `eventData`, `transactionHash`, and `blockNumber` and posts it to the core OTC backend using HMAC-SHA256 headers.
-2. **Durable Queuing & Error Resilience**:
-   * If `nrx-otc-backend` returns an error, the payload is captured by the `DurableQueueService` and written to the local `durablequeues` collection for cron retry.
-3. **Monotonic Checkpoint Updates**:
-   * The checkpoint collection `listenerblockcheckpoints` is updated atomically using a `$max` query on the `blockNumber`.
-4. **WebSocket Replay Recovery**:
-   * On reconnection, the listener retrieves the stored checkpoint block from `nrx-otc-backend` and queries historical blocks to bridge the downtime gap.
+---
+
+### 2.7 Investment Rejection (`InvestmentRejected` event)
+Triggers when the administrator rejects the investment tranche on-chain. The event is parsed by the stateless listener and pushed to the core backend.
+
+#### Database Operations & State Lifecycle
+1. **Investment Rejection State (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `fundinginvestments`
+   * **Operation**: Update (`updateOne`) matching the `investId`.
+   * **Key Fields Updated**:
+     * `status`: Transitions to `"rejected"`.
+     * `rejectedReason`: Stored reason string provided by the on-chain event.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `fundinginvestments` | `status` | String | Update | Transitions to `"rejected"`. |
+| **OTC DB** | `fundinginvestments` | `rejectedReason` | String | Update | Stored rejection reason. |
+
+---
+
+### 2.8 Airdrop Campaign Creation
+Launches new promotional programs.
+
+#### Database Operations & State Lifecycle
+1. **Campaign Registration (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `airdrops`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `title`: Campaign name.
+     * `description`: Campaign text details.
+     * `totalAmount`: Stored token allocation count.
+     * `tokenAddress`: Address of the distributed token on-chain.
+     * `airdropStatus`: Set to `0` (Draft) on setup, then updated to `1` (Active) when launching.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `airdrops` | `title` | String | Insert | Airdrop title. |
+| **OTC DB** | `airdrops` | `description` | String | Insert | Campaign descriptions. |
+| **OTC DB** | `airdrops` | `totalAmount` | Number | Insert | Tokens total pool. |
+| **OTC DB** | `airdrops` | `tokenAddress` | String | Insert | EVM token contract address. |
+| **OTC DB** | `airdrops` | `airdropStatus` | Number | Insert / Update | `0` (Draft) or `1` (Active). |
+
+---
+
+### 2.9 Buy Tokens Approval
+Updates the status of token purchase requests.
+
+#### Database Operations & State Lifecycle
+1. **Purchase State update (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `buytokens`
+   * **Operation**: Update (`updateOne`) matching token order `_id`.
+   * **Key Fields Updated**:
+     * `status`: Updated to `"approved"` (or `"rejected"`).
+     * `transactionHash`: Stored payout verification transaction hash.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `buytokens` | `status` | String | Update | Set to `"approved"` or `"rejected"`. |
+| **OTC DB** | `buytokens` | `transactionHash`| String | Update | Tx confirmation hash. |
+
+---
+
+### 2.10 Yield Distribution Setup
+Seeds yield payouts for active fund investors.
+
+#### Database Operations & State Lifecycle
+1. **Yield Record Generation (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `fundassetyieldmanagements`
+   * **Operation**: Upsert (`findOneAndUpdate` with `{ upsert: true }` matching fund and investor key combination)
+   * **Key Fields Stored**:
+     * `fundId` / `investorId`: Target identities.
+     * `yieldAmount`: Calculated yield.
+     * `yieldPercentage`: Relative return percentage.
+     * `payoutDate`: Planned yield release timestamp.
+     * `status`: Set to `"pending"`.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `fundassetyieldmanagements` | `fundId` | ObjectId | Upsert Match | Reference fund identifier. |
+| **OTC DB** | `fundassetyieldmanagements` | `investorId` | ObjectId | Upsert Match | Reference investor identifier. |
+| **OTC DB** | `fundassetyieldmanagements` | `yieldAmount` | Number | Insert / Update | Distributed yield capital. |
+| **OTC DB** | `fundassetyieldmanagements` | `yieldPercentage`| Number | Insert / Update | Yield rate weight. |
+| **OTC DB** | `fundassetyieldmanagements` | `payoutDate` | Date | Insert / Update | Release date timestamp. |
+| **OTC DB** | `fundassetyieldmanagements` | `status` | String | Insert | Set to `"pending"`. |
+
+---
+
+### 2.11 Site Settings Configuration
+Maintains system variables.
+
+#### Database Operations & State Lifecycle
+1. **Configuration Registry Update (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `site_settings`
+   * **Operation**: Upsert (`findOneAndUpdate` matching global identity)
+   * **Key Fields Stored**:
+     * `maintenanceMode`: Boolean flag.
+     * `allowedCountries`: Array of geocodes allowed access.
+     * `feeStructure`: Net percentage transaction fee configurations.
+     * `adminId`: ObjectId of editing admin.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `site_settings` | `maintenanceMode` | Boolean | Upsert / Update | Platform maintenance flag. |
+| **OTC DB** | `site_settings` | `allowedCountries`| Array | Upsert / Update | List of allowed ISO codes. |
+| **OTC DB** | `site_settings` | `feeStructure` | Object | Upsert / Update | Admin percentage settings. |
+| **OTC DB** | `site_settings` | `adminId` | ObjectId | Upsert / Update | Editing admin link. |
+
+---
+
+### 2.12 Block Checkpoint Update
+Maintains the block pointer for stateless blockchain event listeners.
+
+#### Database Operations & State Lifecycle
+1. **Checkpoint Progress Commit (OTC DB)**:
+   * **Database**: Local OTC Business Database
+   * **Collection**: `listenerblockcheckpoints`
+   * **Operation**: Update (`updateOne` using `$max`) matching `_id: "global"`.
+   * **Key Fields Updated**:
+     * `blockNumber`: Atomically advances to the highest parsed block number, preventing older event replays from moving the pointer backward.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **OTC DB** | `listenerblockcheckpoints` | `_id` | String | Match | Filter set to `"global"`. |
+| **OTC DB** | `listenerblockcheckpoints` | `blockNumber` | Number | Update ($max) | Increments block height check pointer. |

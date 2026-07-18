@@ -1,591 +1,1009 @@
 # NRX RWA Database Storage Flow Documentation
 
-This document provides a comprehensive, end-to-end technical reference for the data lifecycles, cross-service synchronization, and blockchain event processing layers across the NRX Real World Asset (RWA) platform services:
-*   `nrx-auth-service`
-*   `nrx-rwa-backend`
-*   `nrx-rwa-contract-backend`
+This document provides a comprehensive, end-to-end technical reference for the data lifecycles, cross-service synchronization, and blockchain event processing layers across the NRX Real World Asset (RWA) platform, structured by platform actors and mapped directly to database collections and schema keys.
 
 ---
 
 ## Master Persistence & CRUD Mappings (RWA Platform)
 
-The following master reference table maps every database operation described in the flows below, linking incoming client endpoints to MongoDB collection queries/updates, microservice boundaries, and blockchain events.
+The following master reference table maps every database operation, linking logical actor-based lifecycles to MongoDB collection queries/updates, database boundaries, and blockchain events.
 
-| Flow / Endpoint | Microservice Boundary | MongoDB Collection | CRUD Operation | Key Database Fields | Blockchain Event / Queue |
+| Actor | Flow / Lifecycle Step | Database Layer | MongoDB Collection | CRUD Operation | Key Database Fields | Blockchain Event / Queue |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Investor** | Investor Registration | Auth DB (Central) <br> RWA DB (Local) | `investors` (Auth) <br> `investors` (RWA) | Insert (Auth) <br> Upsert (RWA Sync) | Insert: `email`, `userName`, `password`, `globalId` <br> Sync: `globalId`, `userName`, `email`, `status` | None |
+| **Investor** | Investor Login & 2FA | Auth DB (Central) | `investors` | Read & Update | Read: `email`, `password`, `twoFaEnabled`, `twoFaSecret` \| Update: `tempToken`, `tempTokenExpiresAt` | None |
+| **Investor** | SIWE Wallet Connection | RWA DB (Local) <br> Auth DB (Central) | `investors` (RWA) <br> `investors` (Auth) | Update (RWA) <br> Update (Auth Sync) | RWA: `walletAddress`, unsets `walletNonce`, `walletNonceExpiresAt` <br> Auth: `walletAddress` mapped to `globalId` | None |
+| **Investor** | KYC Status Update | Auth DB (Central) | `investors` | Update | `KYCVerified`, `kycReviewedAt` | None |
+| **Investor** | Profile Settings Update | RWA DB (Local) | `investors` | Update | `phoneNumber`, `address`, `city`, `country`, `postalCode` | None |
+| **Investor** | Contact Support Request | RWA DB (Local) | `investorcontactsupports` | Insert | `investorId`, `name`, `email`, `subject`, `message`, `status` (pending) | None |
+| **Investor** | Account Deletion Request | RWA DB (Local) | `investordeleteds` | Insert | `investorId`, `email`, `reason`, `status` (pending) | None |
+| **Investor** | Investment Creation | RWA DB (Local) | `assetinvestments` <br> `assetinvestmentdocuments` | Insert (Investment) <br> Insert (Document) | Investment: `investorId`, `assetId`, `amountInvested`, `sharedQuantity`, `status` (pending), `holdingPeriod` <br> Document: `assetInvestmentId`, `documentUrl` | AWS S3 Upload (Mutual Agreement PDF) |
+| **Investor** | Investment Approve (On-Chain Approve) | RWA DB (Local) | `assetinvestments` <br> `assetmanagements` | Update (Investment) <br> Update (Asset Metrics) | Investment: `status` (approved), `transactionHash`, `maturityDate`, `investmentId`, `ownershipPercentage` <br> Asset: `remainingTokens`, `progressBar`, `assetStatus` | `InvestmentApproved` (Contract) <br> Fireblocks Vault Import |
+| **Investor** | Asset Completion (On-Chain Complete) | RWA DB (Local) | `assetinvestments` | Read & Update | Read: `assetId`, `investorId` \| Update: `maturityEmailSent`, `profitAmount`, `profitPercentage`, `maturityDate` | `AssetCompleted` (Contract) |
+| **Investor** | Buyback Request (On-Chain Request) | RWA DB (Local) | `assetinvestments` | Read & Update | Read: `investmentId`, `investorId` \| Update: `withdrawalRequestId`, `withdrawalRequestedAmount`, `withdrawalStatus` (requested) | `BuyBackRequested` (Contract) |
+| **Investor** | Buyback Approval (On-Chain Approve) | RWA DB (Local) | `assetinvestments` <br> `assetyieldmanagements` | Update (Investment) <br> Update (Yields) | Investment: `withdrawalStatus` (approved), `status` (completed), `withdrawalAmount`, `ownershipPercentage` (0) <br> Yields: `status` (completed), `isWithdrawn` (true) | `BuyBackApproved` (Contract) |
+| **Investor** | Yield Claim / Withdrawal | RWA DB (Local) | `assetyieldmanagements` | Update & Upsert | Update: `isWithdrawn` (true), `status` (completed) on rental yields \| Upsert: Audit record with `yieldType` (withdraw) | None |
+| **Investor** | Dividend Claiming | RWA DB (Local) | `dividendfundmanagements` | Update | `status` (completed), `transactionHash` | None |
+| **Creator** | Creator Registration | RWA DB (Local) | `users` | Insert | `userName`, `email`, `password`, `status` (1), `nonce` (0), `twoFaEnabled` (false) | None |
+| **Creator** | Creator Login & 2FA | RWA DB (Local) | `users` | Read & Update | Read: `email`, `password`, `twoFaEnabled` \| Update: `tempToken`, `tempTokenExpiresAt` | None |
+| **Creator** | SIWE Wallet Connection | RWA DB (Local) | `users` | Update | `walletAddress`, unsets `walletNonce`, `walletNonceExpiresAt` | None |
+| **Creator** | Profile Settings Update | RWA DB (Local) | `users` | Update | `phoneNumber`, `address`, `city`, `country`, `postalCode` | None |
+| **Creator** | Contact Support Request | RWA DB (Local) | `usercontactsupports` | Insert | `userId`, `name`, `email`, `subject`, `message`, `status` (pending) | None |
+| **Creator** | Account Deletion Request | RWA DB (Local) | `userdeleteds` | Insert | `userId`, `email`, `reason`, `status` (pending) | None |
+| **Creator** | Asset Registration | RWA DB (Local) | `assetmanagements` | Insert | `creatorId`, `categoryName`, `assetManagementStatus` (0/draft), `progressBar` (0), `basicInformation` | None |
+| **Admin** | Admin Login & 2FA | RWA DB (Local) | `admins` | Read & Update | Read: `email`, `password`, `twoFactorEnabled`, `twoFactorSecret` \| Update: `lastLoginAt`, `jwtTokens` | None |
+| **Admin** | Admin Wallet Auth | RWA DB (Local) | `admins` | Read & Update | Read: `walletAddress`, `walletNonce`, `walletNonceExpiresAt` \| Update: `walletNonce` (nullified), `jwtTokens` | None |
+| **Admin** | Resolve Investor Support ticket | RWA DB (Local) | `investorcontactsupports` | Update | `status` (resolved), `adminNote`, `resolvedAt` | None |
+| **Admin** | Resolve Creator Support ticket | RWA DB (Local) | `usercontactsupports` | Update | `status` (resolved), `adminNote`, `resolvedAt` | None |
+| **Admin** | Approve Investor Account Deletion | RWA DB (Local) | `investordeleteds` <br> `investors` | Update (Request) <br> Update (Profile) | Request: `status` (deleted), `deletedAt` <br> Profile: `status` (0 / Suspended) | None |
+| **Admin** | Approve Creator Account Deletion | RWA DB (Local) | `userdeleteds` <br> `users` | Update (Request) <br> Update (Profile) | Request: `status` (deleted), `deletedAt` <br> Profile: `status` (0 / Suspended) | None |
+| **Admin** | Asset Listing Approval | RWA DB (Local) | `assetmanagements` | Update | `AdminId`, `assetManagementStatus` (2/approved), `securityToken`, `transactionHash`, `assetStatus` | None |
+| **Admin** | Asset Completion Ledger | RWA DB (Local) | `assetmanagements` <br> `assetmanagementcompletes` | Update (Asset) <br> Upsert (Ledger) | Asset: `assetStatus` (Closed), `assetCompletionStatus` (1) <br> Complete: `creatorId`, `assetId`, `assetCompletionDate`, `assetFinalAmount`, `profitGenerated` | `AssetCompleted` (Contract) |
+| **Admin** | Rental Yield Allocation | RWA DB (Local) | `assetyieldmanagements` | Upsert | `AssetId`, `investerId`, `netAmount`, `netAmountDecimals`, `sharesHolding`, `yieldMonth`, `yieldYear`, `yieldType` (rental) | None |
+| **Admin** | Dividend Distribution Setup | RWA DB (Local) | `dividendfundmanagements` | Upsert | `assetId`, `investorId`, `dividendAmount`, `dividendPercentage`, `payoutDate`, `status` (pending) | None |
+| **Admin** | Site Settings Configuration | RWA DB (Local) | `site_settings` | Upsert | `maintenanceMode`, `allowedCountries`, `feeStructure`, `adminId` | None |
+| **Admin** | Admin Panel Config | RWA DB (Local) | `adminsettings` | Upsert | `themePreference`, `notificationSettings`, `twoFactorConfig` | None |
+| **Admin** | Block Checkpoint | RWA DB (Local) | `listenerblockcheckpoints` | Update ($max) | `blockNumber` (atomic monotonic update) | None |
+
+---
+
+## 1. Actor: Investor Flows
+
+### 1.1 Investor Registration & Synchronization
+When a new investor registers, their credentials and global identifiers are established centrally in the Auth DB before synchronizing downstream to the local RWA DB.
+
+#### Database Operations & State Lifecycle
+1. **Duplicate Account Check (Auth DB)**:
+   * **Database**: Central Identity Database
+   * **Collection**: `investors`
+   * **Operation**: Read (`findOne`)
+   * **Key Fields**:
+     * `email`: Checked to verify no duplicate account exists.
+     * `userName`: Checked to verify handle uniqueness.
+2. **Central Account Insertion (Auth DB)**:
+   * **Database**: Central Identity Database
+   * **Collection**: `investors`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `email`: User login email.
+     * `userName`: Chosen username.
+     * `password`: Bcrypt hashed password.
+     * `globalId`: Auto-generated UUID/ObjectId reference.
+     * `twoFaEnabled`: Hardcoded to `false` on registration.
+     * `status`: Hardcoded to `1` (Active).
+     * `registeredPlatform`: Stored as `"NRX-RWA"` to track platform origin.
+3. **Local Profile Sync (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `investors`
+   * **Operation**: Upsert (`findOneAndUpdate` with `{ upsert: true }`) matching the unique `globalId`
+   * **Key Fields Stored**:
+     * `globalId`: Links the local record directly to the Auth DB credentials.
+     * `email`: Synced from the Auth DB.
+     * `userName`: Synced from the Auth DB.
+     * `status`: Set to `1` (Active).
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Investor Login** (POST `/api/v1/investor/auth/login`) | Client -> RWA Backend -> Auth Service | `investors` (Auth DB) | Read | `email`, `passwordHash`, `tempToken`, `tempTokenExpiresAt`, `is2FAEnabled` | None |
-| **Verify Login 2FA** (POST `/api/v1/investor/auth/verify-2fa`) | Client -> RWA Backend -> Auth Service | `investors` (Auth DB) | Read & Update | Read: `tempToken` \| Update: `tempToken` (nullified) | None |
-| **Investor Registration** (POST `/api/v1/investor/auth/register`) | Client -> RWA Backend -> Auth Service | `investors` (Auth DB), `investors` (RWA DB) | Insert (Auth) / S2S Sync (RWA) | Insert: `email`, `userName`, `passwordHash`, `globalId` \| S2S: `globalId`, `userName`, `email` | None |
-| **SIWE Nonce** (POST `/api/v1/investor/wallet/nonce`) | Client -> RWA Backend | `investors` (RWA DB) | Update | `walletNonce`, `walletNonceExpiresAt` | None |
-| **SIWE Verification** (POST `/api/v1/investor/connect/wallet`) | Client -> RWA Backend -> Auth Service | `investors` (RWA DB), `investors` (Auth DB) | Update (RWA) / S2S Sync (Auth) | Update: `walletAddress` \| S2S: `walletAddress` synced to Auth Service | None |
-| **Sumsub KYC Webhook** (POST `/api/v1/admin/kyc/webhook`) | Sumsub -> RWA Backend -> Auth Service | `investors` (Auth DB) | Update | `kycStatus`, `kycReviewedAt` | None |
-| **Admin Login & 2FA** (POST `/api/v1/admin/login`) | Client -> RWA Backend | `admins` (RWA DB) | Read & Update | Read: `email`, `passwordHash`, `twoFASecret` \| Update: `lastLoginAt` | None |
-| **Admin Wallet Auth** (POST `/api/v1/admin/login/wallet`) | Client -> RWA Backend | `admins` (RWA DB) | Read & Update | Read: `walletAddress`, `walletNonce` \| Update: `walletNonce` (nullified) | None |
-| **RWA Investment Create** (POST `/invest`) | Client -> RWA Backend | `assetinvestments`, `assetinvestmentdocuments` | Insert (Investment) / Insert (Document) | Investment: `investorId`, `assetId`, `amountInvested`, `isInvestorAgreed` | S3 Upload (Signature & Agreement PDF) |
-| **RWA Investment Approve** (`/investment-approved`) | Listener -> RWA Backend | `assetinvestments`, `assetmanagements` | Update (Investment) / Update (Asset) | Investment: `status` (approved), `transactionHash`, `maturityDate`, `investmentId` \| Asset: `remainingTokens`, `progressBar` | Fireblocks Vault Sync |
-| **RWA Asset Completion** (`/asset-completed`) | Listener -> RWA Backend | `assetinvestments`, `assetmanagements`, `assetmanagementcompletes` | Update (Investment) / Update (Asset) / Upsert (Complete) | Investment: `maturityEmailSent`, `profitAmount`, `profitPercentage` \| Asset: `assetStatus` (Closed), `assetCompletionStatus` (1) | Email Queue (Redis) |
-| **RWA Buyback Request** (`/buy-back/requested`) | Listener -> RWA Backend | `assetinvestments` | Update | `withdrawalRequestId`, `withdrawalRequestedAmount`, `withdrawalStatus` (requested) | None |
-| **RWA Buyback Approve** (`/buy-back/approved`) | Listener -> RWA Backend | `assetinvestments`, `assetyieldmanagements` | Update (Investment) / Update (Yields) | Investment: `withdrawalStatus` (approved), `status` (completed), `ownershipPercentage` (0) | None |
-| **RWA Asset Yield** (`/asset-yield`) | Listener -> RWA Backend | `assetyieldmanagements` | Upsert | `netAmount`, `yieldMonth`, `yieldYear`, `status`, `isYieldClosed`, `sharesHolding` | `getClaimableIncome` (Contract) |
-| **RWA Yield Claim** (`/asset-withdrawal`) | Listener -> RWA Backend | `assetyieldmanagements` | Update & Upsert | Update: `isWithdrawn` (true) on rental yields \| Upsert: `netAmount`, `yieldType` (withdraw) | None |
-| **Block Checkpoint** (`/block-checkpoint`) | Listener -> RWA Backend | `listenerblockcheckpoints` | Update ($max) | `blockNumber` (atomic monotonic update) | None |
+| **Auth DB** | `investors` | `email` | String | Insert / Read | Investor's unique identifier/email. |
+| **Auth DB** | `investors` | `userName` | String | Insert / Read | Unique display handle. |
+| **Auth DB** | `investors` | `password` | String | Insert | Bcrypt-hashed login credential. |
+| **Auth DB** | `investors` | `globalId` | UUID / String | Insert / Sync | Centralized ID linking all platform databases. |
+| **Auth DB** | `investors` | `twoFaEnabled` | Boolean | Insert | Set to `false` on initialization. |
+| **Auth DB** | `investors` | `status` | Number | Insert | Set to `1` (active) on initialization. |
+| **Auth DB** | `investors` | `registeredPlatform` | String | Insert | Set to `"NRX-RWA"`. |
+| **RWA DB** | `investors` | `globalId` | UUID / String | Upsert Match | Matches sync key. |
+| **RWA DB** | `investors` | `email` | String | Update | Copy of central login email. |
+| **RWA DB** | `investors` | `userName` | String | Update | Copy of central display handle. |
+| **RWA DB** | `investors` | `status` | Number | Update | Local status initialized to `1`. |
 
 ---
 
-## 1. Authentication & Sync Flows
+### 1.2 Investor Login & 2FA Flow
+Authenticating investor accounts, verifying passwords, and enforcing temporary Multi-Factor session states.
 
-### 1.1 Investor Login & JWT Handoff Flow
+#### Database Operations & State Lifecycle
+1. **Credentials Retrieval (Auth DB)**:
+   * **Database**: Central Identity Database
+   * **Collection**: `investors`
+   * **Operation**: Read (`findOne`) matching the submitted email.
+   * **Key Fields Read**:
+     * `email`: Query filter.
+     * `password`: Fetched to verify against user input using bcrypt comparison.
+     * `twoFaEnabled`: Checked to verify if 2FA verification is required.
+2. **Temporary 2FA Session Creation (Auth DB - If 2FA is active)**:
+   * **Database**: Central Identity Database
+   * **Collection**: `investors`
+   * **Operation**: Update (`updateOne`)
+   * **Key Fields Updated**:
+     * `tempToken`: Writes a short-lived JSON Web Token string hash.
+     * `tempTokenExpiresAt`: Writes a timestamp defining the 10-minute expiry window.
+3. **2FA Verification (Auth DB - If 2FA is active)**:
+   * **Database**: Central Identity Database
+   * **Collection**: `investors`
+   * **Operation**: Read (`findOne`) matching the verification token.
+   * **Key Fields Read**:
+     * `tempToken`: Query criteria.
+     * `tempTokenExpiresAt`: Read to confirm the validation window is still active.
+     * `twoFaSecret`: Stored TOTP secret used to check the user's OTP code.
+4. **2FA Session Cleanup (Auth DB - If 2FA is active)**:
+   * **Database**: Central Identity Database
+   * **Collection**: `investors`
+   * **Operation**: Update (`updateOne`)
+   * **Key Fields Updated**:
+     * `tempToken`: `$unset` or set to `null` to disable reuse.
+     * `tempTokenExpiresAt`: `$unset` or set to `null` to clear.
 
-The RWA backend delegates credentials verification to the centralized `nrx-auth-service`.
-
-#### Data Flow & Mappings
-1. **Client API Request**: Client submits credentials to the RWA backend:
-   * **Endpoint**: `POST /api/v1/investor/auth/login` (Controller: `AuthInvestorController.login`)
-   * **DTO & Validation**: `LoginAuthInvestorDto` (fields: `email`, `password`).
-2. **S2S Proxy Call**: The RWA service routes the payload to `nrx-auth-service` via a secure HTTPS S2S POST request:
-   * **Auth Endpoint**: `POST /api/v1/investor/login` (Controller: `InvestorController.login`).
-3. **Database Read (Auth Service)**: 
-   * **Service**: `InvestorService.login`
-   * **MongoDB Operation**: `findOne` on `Investor` collection (in Auth DB) matching the verified `email`.
-   * **Credentials Verification**: Performs `bcrypt.compare` between input password and the stored `passwordHash`.
-4. **JWT & 2FA State Routing**:
-   * If **2FA is disabled**: Returns `sessionToken` (expires in 24 hours), `is2FARequired: false`, and the `Investor` document fields.
-   * If **2FA is enabled**: Generates a short-lived `tempToken` (JWT expiring in 10 minutes containing the investor's `globalId`), sets `is2FARequired: true`, and updates the database:
-     * **MongoDB Operation**: `updateOne` on the `Investor` collection.
-     * **Fields Updated**: `tempToken` (stored string hash) and `tempTokenExpiresAt`.
-5. **2FA Verification Endpoints (If 2FA is active)**:
-   * Client presents OTP and `tempToken` to the RWA backend, which proxies to `nrx-auth-service`:
-     * **Auth Endpoint**: `POST /api/v1/investor/verify-2fa` (Controller: `InvestorController.verify2FA`)
-     * **DTO**: `Verify2FAInvestorDto` (`tempToken`, `otpCode`).
-     * **MongoDB Operation**: `findOne` on `Investor` collection matching `tempToken` and checks that `tempTokenExpiresAt` > current time.
-     * **Verification**: Verifies OTP against the stored `twoFASecret` using `speakeasy.totp.verify`.
-     * **MongoDB Operation (Post-Verification)**: `updateOne` to nullify `tempToken` and `tempTokenExpiresAt` to prevent replay attacks.
-6. **Cookie Setting**: The RWA controller intercepts the returning `sessionToken` from Auth Service and writes it as an `HttpOnly`, `Secure`, `SameSite=Lax` cookie named `investor_session` directly to the client's express response header, while also issuing a CSRF token.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Investor as Client Browser
-    participant RWA as RWA Backend
-    participant Auth as Auth Service
-    participant DB as MongoDB (Auth DB)
-
-    Investor->>RWA: POST /auth/login (email, password)
-    RWA->>Auth: S2S Proxy: POST /api/v1/investor/login
-    Auth->>DB: findOne({ email })
-    DB-->>Auth: Investor Record (passwordHash, is2FAEnabled)
-    Note over Auth: bcrypt.compare(password, passwordHash)
-    alt 2FA is Enabled
-        Note over Auth: Generate tempToken (JWT, 10m expiry)
-        Auth->>DB: updateOne({ _id }, { $set: { tempToken, tempTokenExpiresAt } })
-        Auth-->>RWA: { is2FARequired: true, tempToken }
-        RWA-->>Investor: { is2FARequired: true, tempToken }
-        Investor->>RWA: POST /auth/verify-2fa (tempToken, otp)
-        RWA->>Auth: S2S Proxy: POST /api/v1/investor/verify-2fa
-        Auth->>DB: findOne({ tempToken })
-        DB-->>Auth: Investor Record (twoFASecret, tempTokenExpiresAt)
-        Note over Auth: speakeasy.totp.verify(otp, twoFASecret)
-        Auth->>DB: updateOne({ _id }, { $unset: { tempToken, tempTokenExpiresAt } })
-        Auth-->>RWA: { sessionToken }
-    else 2FA is Disabled
-        Note over Auth: Generate sessionToken (JWT, 24h expiry)
-        Auth-->>RWA: { sessionToken }
-    end
-    Note over RWA: Set HttpOnly Cookie (investor_session) & Issue CSRF
-    RWA-->>Investor: HTTP 200 OK (with Cookies & CSRF Header)
-```
-
----
-
-### 1.2 Investor Registration Flow
-
-Registration coordinates account creation across the central Identity database and local business database engine (RWA), maintaining schema segregation.
-
-#### Data Flow & Mappings
-1. **Client API Request**: Client submits registration details:
-   * **RWA Endpoint**: `POST /api/v1/investor/auth/register` (Controller: `AuthInvestorController.register`)
-   * **DTO**: `RegisterAuthInvestorDto` (fields: `email`, `userName`, `password`).
-2. **S2S Handoff**: RWA sends a secure POST to `nrx-auth-service`:
-   * **Auth Endpoint**: `POST /api/v1/investor/register` (Controller: `InvestorController.register`).
-3. **Database Insertion (Auth Service)**:
-   * **Service**: `InvestorService.register`
-   * **Duplicate Verification**: Executes `findOne` on `Investor` (Auth DB) to confirm neither `email` nor `userName` exists.
-   * **Password Hashing**: `bcrypt.hash` with salt rounds = 10.
-   * **MongoDB Operation**: `insertOne` on the `Investor` collection (Auth DB).
-   * **Fields Populated**: `email`, `userName`, `passwordHash`, `globalId` (auto-generated UUID), `is2FAEnabled: false`.
-4. **S2S Synchronous Downstream Propagation**:
-   * Auth Service broadcasts account generation to RWA service.
-   * **Propagation Call**: Signs an HMAC-SHA256 signature containing `globalId`, `userName`, and `email`, and sends a POST to:
-     * **RWA Sync API**: `POST /api/v1/listeners/sync-session`
-   * **Signature Verification**: Receivers calculate the HMAC using the local shared S2S secret (e.g., `S2S_NRX_RWA_KEY`) and check it against the incoming signature in the headers.
-   * **Local MongoDB Operation**: `findOneAndUpdate` with `{ globalId }` and `{ upsert: true }` on the local `Investor` collection.
-   * **Fields Populated**: `globalId`, `userName`, `email`.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Investor as Client Browser
-    participant RWA as RWA Backend
-    participant Auth as Auth Service
-    participant DB_Auth as Auth MongoDB
-    participant DB_Local as Local MongoDB (RWA)
-
-    Investor->>RWA: POST /auth/register (email, userName, password)
-    RWA->>Auth: S2S Proxy: POST /api/v1/investor/register
-    Auth->>DB_Auth: findOne({ $or: [{ email }, { userName }] })
-    DB_Auth-->>Auth: Null (No duplicates)
-    Note over Auth: Hash Password (bcrypt)
-    Auth->>DB_Auth: insertOne({ globalId, email, passwordHash, ... })
-    
-    Auth->>RWA: S2S Signed HMAC: POST /sync-session (globalId, email, userName)
-    Note over RWA: Verify HMAC Header
-    RWA->>DB_Local: findOneAndUpdate({ globalId }, { $set: { email, userName } }, { upsert: true })
-    
-    Auth-->>RWA: { success: true }
-    RWA-->>Investor: HTTP 201 Created
-```
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Auth DB** | `investors` | `email` | String | Read Match | Target matching login identifier. |
+| **Auth DB** | `investors` | `password` | String | Read | Stored bcrypt hash for verification. |
+| **Auth DB** | `investors` | `twoFaEnabled` | Boolean | Read | Checks if Multi-Factor is enforced. |
+| **Auth DB** | `investors` | `twoFaSecret` | String | Read | Enforces TOTP cryptographic checks. |
+| **Auth DB** | `investors` | `tempToken` | String | Update / Unset | Ephemeral validation session code. |
+| **Auth DB** | `investors` | `tempTokenExpiresAt`| Date | Update / Unset | Validation session timer. |
 
 ---
 
 ### 1.3 SIWE Wallet Connection Flow
+Validating ownership of decentralised addresses on the blockchain and syncing them back to central profile records.
 
-The platform relies on Sign-in with Ethereum (SIWE) to verify blockchain ownership, linking local investor profiles to decentralized wallet addresses.
+#### Database Operations & State Lifecycle
+1. **Nonce Initialization (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `investors`
+   * **Operation**: Update (`updateOne`) matching the investor's local `_id`.
+   * **Key Fields Updated**:
+     * `walletNonce`: Generates and writes a secure cryptographic nonce string.
+     * `walletNonceExpiresAt`: Writes an expiry timestamp (5-minute window).
+2. **Nonce Verification (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `investors`
+   * **Operation**: Read (`findOne`) matching investor `_id`.
+   * **Key Fields Read**:
+     * `walletNonce`: Compared against the signed message payload.
+     * `walletNonceExpiresAt`: Checked to ensure validation timeframe is active.
+3. **Local Wallet Registration (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `investors`
+   * **Operation**: Update (`updateOne`) matching investor `_id`.
+   * **Key Fields Updated**:
+     * `walletAddress`: Stores the normalized lowercase Ethereum address.
+     * `walletNonce`: `$unset` or cleared.
+     * `walletNonceExpiresAt`: `$unset` or cleared.
+4. **Central Wallet Synchronization (Auth DB)**:
+   * **Database**: Central Identity Database
+   * **Collection**: `investors`
+   * **Operation**: Update (`updateOne`) matching the `globalId`.
+   * **Key Fields Updated**:
+     * `walletAddress`: Syncs the Ethereum wallet address to the central record.
 
-#### Data Flow & Mappings
-1. **Nonce Generation**:
-   * **Endpoint**: `POST /api/v1/investor/wallet/nonce` (Controller: `AuthInvestorController.getWalletNonce`)
-   * **DTO**: `GetNonceInvestorDto` (`walletAddress`).
-   * **MongoDB Operation**: `updateOne` on the local `Investor` collection.
-   * **Fields Updated**: `walletNonce` (randomly generated cryptographically secure string) and `walletNonceExpiresAt` (expiry set to 5 minutes).
-   * **Return**: Nonce returned to the client.
-2. **Signature Verification & Connection**:
-   * **Endpoint**: `POST /api/v1/investor/connect/wallet` (Controller: `AuthInvestorController.connectWallet`)
-   * **DTO**: `LoginWalletInvestorDto` (fields: `walletAddress`, `message`, `signature`).
-   * **Validation (SIWE parser)**:
-     * Parses the SIWE message.
-     * Verifies the nonce in the message matches the stored `walletNonce` on the database.
-     * Confirms the domain/origin matches the platform's configuration limits (`SIWE_ALLOWED_DOMAINS`).
-     * Validates that the chain ID is allowlisted (`SIWE_ALLOWED_CHAIN_IDS`).
-     * Verifies signature authenticity using `ethers.verifyMessage` matching the public `walletAddress`.
-3. **Database Updates & Sync**:
-   * **Local MongoDB Operation**: `findOneAndUpdate` on local `Investor` collection matching investor `_id`.
-   * **Fields Updated**: Sets `walletAddress` (normalized to lowercase), clears `walletNonce` and `walletNonceExpiresAt`.
-   * **S2S Sync Call**: Invokes `nrx-auth-service` via secure HMAC-signed request:
-     * **Endpoint**: `POST /api/v1/investor/sync-wallet` (Controller: `InvestorController.internalSyncWallet`).
-     * **Auth MongoDB Operation**: `updateOne` on the central `Investor` collection.
-     * **Fields Updated**: `walletAddress` mapped to `globalId`.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Investor as Client Browser
-    participant RWA as RWA Backend
-    participant Auth as Auth Service
-    participant DB_Local as Local MongoDB (RWA)
-    participant DB_Auth as Auth MongoDB
-
-    Investor->>RWA: POST /wallet/nonce (walletAddress)
-    Note over RWA: Generate Cryptographic Nonce
-    RWA->>DB_Local: updateOne({ _id }, { walletNonce, walletNonceExpiresAt })
-    RWA-->>Investor: { nonce }
-    
-    Investor->>RWA: POST /connect/wallet (walletAddress, message, signature)
-    RWA->>DB_Local: findOne({ _id })
-    DB_Local-->>RWA: Investor (walletNonce, walletNonceExpiresAt)
-    Note over RWA: Verify Signature & SIWE message components
-    RWA->>DB_Local: updateOne({ _id }, { $set: { walletAddress }, $unset: { walletNonce, walletNonceExpiresAt } })
-    
-    RWA->>Auth: S2S Signed HMAC: POST /sync-wallet (globalId, walletAddress)
-    Auth->>DB_Auth: updateOne({ globalId }, { $set: { walletAddress } })
-    DB_Auth-->>Auth: Acknowledged
-    Auth-->>RWA: { status: true }
-    RWA-->>Investor: HTTP 200 OK (Wallet Linked)
-```
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `investors` | `walletNonce` | String | Update / Unset | Random string used for verification. |
+| **RWA DB** | `investors` | `walletNonceExpiresAt`| Date | Update / Unset | Expiration window for wallet connection. |
+| **RWA DB** | `investors` | `walletAddress` | String | Update | Confirmed lowercase Ethereum address. |
+| **Auth DB** | `investors` | `walletAddress` | String | Update | Synced lowercase address linked via `globalId`. |
 
 ---
 
-### 1.4 Sumsub KYC Webhook Flow
+### 1.4 KYC Verification Webhook
+Updates central verification logs when Sumsub returns approval or rejection.
 
-KYC verification status changes are pushed asynchronously by Sumsub via webhooks, parsed by the backends, and synced globally.
+#### Database Operations & State Lifecycle
+1. **KYC Verification Update (Auth DB)**:
+   * **Database**: Central Identity Database
+   * **Collection**: `investors`
+   * **Operation**: Update (`findOneAndUpdate`) matching the user's `globalId`.
+   * **Key Fields Updated**:
+     * `KYCVerified` (or `kycStatus`): Updated to:
+       * `1` (Approved) if the Sumsub hook returns `GREEN`.
+       * `2` (Rejected) if the Sumsub hook returns `RED`.
+     * `kycReviewedAt`: Updated to the current date and time.
 
-#### Data Flow & Mappings
-1. **External Webhook Trigger**: Sumsub triggers a verification response to the listener endpoint:
-   * **Endpoint**: `POST /api/v1/admin/kyc/webhook` (Controller: `SumsubWebhookController.handleWebhook`)
-2. **Local Processing**:
-   * **Service**: `AuthAdminService.updateKYCStatus`
-   * **Validation**: Extracts `reviewStatus` and `reviewResult.reviewAnswer`.
-   * **Status Code Mapping**:
-     * `GREEN` (Answer: `GREEN`) -> Internal code `1` (Approved)
-     * `RED` (Answer: `RED`) -> Internal code `2` (Rejected)
-3. **S2S Synchronization**:
-   * **Request**: RWA posts status change to Auth Service via HMAC-signed payload:
-     * **Endpoint**: `POST /api/v1/investor/sync-kyc`
-   * **Auth MongoDB Operation**: `findOneAndUpdate` matching the investor's `globalId`.
-   * **Fields Updated**: `kycStatus` (updated to `1` or `2`), `kycReviewedAt` (current timestamp).
-4. **Alerts & Notifications**:
-   * **Queue**: The local service sends a notification email to the investor (using `EmailHelper` or pushing to the redis `EmailQueueService`) notifying them of approval or rejection.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Sumsub as Sumsub Service
-    participant RWA as RWA Backend
-    participant Auth as Auth Service
-    participant DB_Auth as Auth MongoDB
-
-    Sumsub->>RWA: POST /kyc/webhook (applicantId, reviewAnswer, reviewStatus)
-    Note over RWA: Map reviewAnswer (GREEN -> 1, RED -> 2)
-    RWA->>Auth: S2S Signed HMAC: POST /sync-kyc (globalId, status)
-    Auth->>DB_Auth: findOneAndUpdate({ globalId }, { $set: { kycStatus, kycReviewedAt } })
-    DB_Auth-->>Auth: Updated Record
-    Auth-->>RWA: { success: true }
-    Note over RWA: Push KYC Status Notification to Email Queue
-    RWA-->>Sumsub: HTTP 200 OK
-```
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Auth DB** | `investors` | `globalId` | UUID / String | Read Match | Filters target profile. |
+| **Auth DB** | `investors` | `KYCVerified` | Number | Update | Verification status: `1` (Approved) or `2` (Rejected). |
+| **Auth DB** | `investors` | `kycReviewedAt` | Date | Update | Datetime KYC webhook processed. |
 
 ---
 
-## 2. Admin & Security Flows
+### 1.5 Profile Settings Update
+Allows investors to customize contact and geolocation data.
 
-### 2.1 Admin Login & 2FA Flow
+#### Database Operations & State Lifecycle
+1. **Investor Contact Settings Update (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `investors`
+   * **Operation**: Update (`updateOne`) matching investor `_id`.
+   * **Key Fields Updated**:
+     * `phoneNumber`: User contact telephone string.
+     * `address`: Resident street address.
+     * `city`: Resident city.
+     * `country`: Resident country.
+     * `postalCode`: Resident area zip code.
 
-Administrators access management features via standard password verification coupled with strict 2FA configurations.
-
-#### Data Flow & Mappings
-1. **Client API Request**: Admin submits login payload:
-   * **Endpoint**: `POST /api/v1/admin/login` (Controller: `AuthAdminController.login`)
-   * **DTO**: `LoginAuthAdminDto` (`email`, `password`).
-2. **Database Verification (Local Business DB)**:
-   * **Service**: `AuthAdminService.login`
-   * **MongoDB Operation**: `findOne` on local `Admin` collection matching `email`.
-   * **Credentials Verification**: Executes `bcrypt.compare` against the stored `passwordHash`.
-3. **2FA State Routing**:
-   * If **2FA is enabled**: Generates short-lived `tempToken`, returns `is2FARequired: true`.
-   * If **2FA is disabled**: Returns `sessionToken` directly.
-4. **2FA OTP Code Submission**:
-   * **Endpoint**: `POST /api/v1/admin/verify-2fa` (Controller: `AuthAdminController.verify2FA`)
-   * **Payload**: `adminId`, `otp`.
-   * **MongoDB Operation**: `findById` on local `Admin` collection.
-   * **TOTP Verification**: Validates `otp` using `speakeasy.totp.verify` against `twoFASecret`.
-5. **Database Updates**:
-   * **MongoDB Operation**: `updateOne` on the `Admin` document.
-   * **Fields Updated**: Updates `lastLoginAt` timestamp.
-6. **Cookie Setting**: Controller calls `setAdminAuthCookie` and issues an admin CSRF token.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Admin as Admin Browser
-    participant RWA as RWA Backend
-    participant DB as MongoDB (RWA DB)
-
-    Admin->>RWA: POST /admin/login (email, password)
-    RWA->>DB: findOne({ email })
-    DB-->>RWA: Admin Record (passwordHash, is2FAEnabled)
-    Note over RWA: bcrypt.compare(password, passwordHash)
-    alt 2FA is Enabled
-        RWA-->>Admin: { is2FARequired: true, adminId }
-        Admin->>RWA: POST /admin/verify-2fa (adminId, otp)
-        RWA->>DB: findById(adminId)
-        DB-->>RWA: Admin Record (twoFASecret)
-        Note over RWA: speakeasy.totp.verify(otp, twoFASecret)
-    end
-    RWA->>DB: updateOne({ _id }, { $set: { lastLoginAt } })
-    Note over RWA: Set HttpOnly Cookie (admin_session) & Admin CSRF
-    RWA-->>Admin: HTTP 200 OK (with Cookies & CSRF Header)
-```
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `investors` | `phoneNumber` | String | Update | Investor's phone number. |
+| **RWA DB** | `investors` | `address` | String | Update | Resident street details. |
+| **RWA DB** | `investors` | `city` | String | Update | Geolocation city. |
+| **RWA DB** | `investors` | `country` | String | Update | Geolocation country. |
+| **RWA DB** | `investors` | `postalCode` | String | Update | Geolocation postal/zip code. |
 
 ---
 
-### 2.2 Admin Wallet Authentication Flow
+### 1.6 Contact Support Request
+Allows investors to log troubleshooting issues directly with administrators.
 
-Administrators can link blockchain wallets to their profiles and authenticate securely using SIWE.
+#### Database Operations & State Lifecycle
+1. **Support Ticket Registration (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `investorcontactsupports`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `investorId`: Reference link to local investor profile.
+     * `name`: Contact name.
+     * `email`: Contact email address.
+     * `subject`: Brief ticket subject.
+     * `message`: Detailed description of the issue.
+     * `status`: Set to `"pending"`.
 
-#### Data Flow & Mappings
-1. **Nonce Request**:
-   * **Endpoint**: `POST /api/v1/admin/wallet/nonce` (Controller: `AuthAdminController.getWalletNonce`)
-   * **DTO**: `GetNonceAdminDto` (`walletAddress`).
-   * **MongoDB Operation**: `updateOne` on the `Admin` collection.
-   * **Fields Updated**: Sets `walletNonce` and `walletNonceExpiresAt`.
-2. **Signature Verification & SIWE Verification**:
-   * **Endpoint**: `POST /api/v1/admin/login/wallet` (Controller: `AuthAdminController.loginWithWallet`)
-   * **DTO**: `LoginWalletAdminDto` (`walletAddress`, `message`, `signature`).
-   * **MongoDB Operation**: `findOne` matching `walletAddress` (normalized to lowercase).
-   * **Validation**: Extracts nonce from message, confirms it matches the stored `walletNonce` on DB, checks signature verification, and nullifies the nonce fields via `updateOne`.
-3. **Session Generation**: Issues the cookie `admin_session` and CSRF tokens.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Admin as Admin Browser
-    participant RWA as RWA Backend
-    participant DB as MongoDB (RWA DB)
-
-    Admin->>RWA: POST /admin/wallet/nonce (walletAddress)
-    Note over RWA: Generate Cryptographic Nonce
-    RWA->>DB: updateOne({ walletAddress }, { walletNonce, walletNonceExpiresAt })
-    RWA-->>Admin: { nonce }
-    
-    Admin->>RWA: POST /admin/login/wallet (walletAddress, message, signature)
-    RWA->>DB: findOne({ walletAddress })
-    DB-->>RWA: Admin Record (walletNonce, walletNonceExpiresAt)
-    Note over RWA: Verify SIWE parameters & Public Key Signature
-    RWA->>DB: updateOne({ _id }, { $unset: { walletNonce, walletNonceExpiresAt } })
-    Note over RWA: Set HttpOnly Cookie (admin_session) & Admin CSRF
-    RWA-->>Admin: HTTP 200 OK (Authenticated)
-```
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `investorcontactsupports` | `investorId` | ObjectId | Insert | Linked profile identifier. |
+| **RWA DB** | `investorcontactsupports` | `name` | String | Insert | Customer name. |
+| **RWA DB** | `investorcontactsupports` | `email` | String | Insert | Customer notification email. |
+| **RWA DB** | `investorcontactsupports` | `subject` | String | Insert | Ticket subject line. |
+| **RWA DB** | `investorcontactsupports` | `message` | String | Insert | Detailed description. |
+| **RWA DB** | `investorcontactsupports` | `status` | String | Insert | Status initialized to `"pending"`. |
 
 ---
 
-## 3. RWA Investment & Asset Lifecycle
+### 1.7 Account Deletion Request
+Ensures regulatory compliance by permitting investors to trigger soft-deletion queues.
 
-The Real World Asset (RWA) platform manages real estate tokenization portfolios, utilizing Fireblocks vault accounts and smart contract configurations.
+#### Database Operations & State Lifecycle
+1. **Compliance Deletion Entry (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `investordeleteds`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `investorId`: Reference link to local investor profile.
+     * `email`: Stored email address.
+     * `reason`: Explanation text provided by the investor.
+     * `status`: Set to `"pending"`.
 
-### 3.1 RWA Investment Lifecycle (Invest/Deposit)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Investor as Client Browser
-    participant RWA as RWA Backend
-    participant DB as MongoDB (RWA DB)
-    participant S3 as AWS S3 Storage
-    participant FB as Fireblocks Service
-    participant Listener as Listener Service
-    participant Contract as Smart Contract (EVM)
-
-    Investor->>RWA: POST /invest (assetId, amountInvested, file)
-    RWA->>DB: findById(assetId) (Read Asset details)
-    RWA->>S3: Upload Investor Signature
-    Note over RWA: Generate Mutual Agreement PDF
-    RWA->>S3: Upload Mutual Agreement PDF
-    S3-->>RWA: pdfUrl
-    RWA->>DB: insertOne(AssetInvestment { status: "pending", isInvestorAgreed: true, amountInvested })
-    RWA->>DB: insertOne(AssetInvestmentDocument { documentUrl: pdfUrl })
-    RWA-->>Investor: HTTP 201 Created (Pending State)
-    
-    Note over Investor: Investor executes sign transaction on frontend
-    Note over Listener: Admin registers/approves investment on-chain
-    Note over Contract: Emit Event: InvestmentApproved(propertyId, investor, investmentId, investmentAmount, maturityPeriod, ...)
-    
-    Listener->>Contract: Detects InvestmentApproved
-    Listener->>RWA: POST /listeners/investment-approved (propertyId, walletAddress, investmentAmount, investmentId)
-    RWA->>DB: findOne({ walletAddress })
-    RWA->>DB: findOne({ assetId, sharedQuantity: investmentAmount, isInvestorAgreed: true, transactionHash: null })
-    RWA->>DB: updateOne({ investmentId }, { status: "approved", transactionHash, maturityDate, investmentId })
-    RWA->>FB: ensureVaultForSecurityToken(walletId, securityToken)
-    Note over RWA: Recalculate remainingTokens & progressBar
-    RWA->>DB: updateOne(AssetManagement { remainingTokens, progressBar, assetStatus })
-    Note over RWA: Invalidate Cache: delPattern("admin:asset-investment:*")
-    Note over RWA: Send Mutual Agreement PDF Email to Investor & Creator
-```
-
-#### Detailed Operations & Mappings
-1. **Creation Endpoint**:
-   * **Endpoint**: `POST /api/v1/investor/asset-investment/invest` (Controller: `AssetInvestmentController.create`)
-   * **DTO**: `CreateAssetInvestmentDto` (`assetId`, `amountInvested`, `sharedQuantity`, `fileType`).
-   * **File Upload**: Signature image file.
-2. **Database Verification**:
-   * Reads from `AssetManagement` to confirm the asset is active and extract the `holdingPeriod`.
-   * Reads from `Investor` to check the investor profile and KYC state.
-3. **Signature S3 Upload & PDF Generation**:
-   * Uploads signature image to S3: `mutual-agreement/${investorId}/signatures/investor-signature-${investorId}`.
-   * Calculates ownership percentage immediately: `(amountInvested / (pricePerToken * numberOfTokens)) * 100`.
-   * Invokes `generateMutualAgreementPDF` to combine investor and administrator signatures into a single contract.
-   * Uploads contract to S3, returning a PDF URL.
-4. **Database Insertion**:
-   * **MongoDB Operation 1**: `insertOne` on the `assetinvestments` collection:
-     * **Initial State**: `status` -> `pending`, `isInvestorAgreed` -> `true`, `investorAgreementDate` -> current date, `holdingPeriod` set from asset configuration.
-   * **MongoDB Operation 2**: `insertOne` on the `assetinvestmentdocuments` collection:
-     * **Fields**: `assetInvestmentId`, `documentUrl` (AWS Link), `documentType` (`mutual-agreement`), `investorSignatureUrl`.
-   * **Notification**: Enqueues an investor confirmation email to the redis queue (`EmailQueueService`). If Redis fails, sends it directly via SMTP.
-5. **Blockchain Approval listener**:
-   * **Blockchain Event `InvestmentApproved`**: Emitted when the lister and administrator finalize the investment on-chain.
-   * **Listener Action**: `ListenersController.investmentApproved` handles the request:
-     * **API Call**: `POST /api/v1/listeners/investment-approved`
-     * **DTO**: `InvestmentApprovalDto` (`propertyId`, `walletAddress`, `investmentAmount`, `investmentId`, `transactionHash`, `maturityPeriod`, `blockNumber`).
-   * **MongoDB Lookup**: 
-     * Finds investor by `walletAddress`.
-     * Finds investment by `assetId`, `investorId`, `sharedQuantity: investmentAmount`, `isInvestorAgreed: true`, `isCreatorAgreed: true`, and verifies `transactionHash` is empty.
-   * **MongoDB Operation (Investment Update)**:
-     * **Fields Updated**: `status` -> `approved`, `transactionHash`, `maturityDate` (derived from the UNIX timestamp `maturityPeriod`), `investmentId` (on-chain identifier), `ownershipPercentage`.
-6. **Fireblocks Vault Allocation**:
-   * If the asset contains a registered `securityToken` and the investor has a `walletId`, the backend calls `fireblocksService.ensureVaultForSecurityToken` to import the token asset directly into the investor's institutional vault.
-7. **Asset Management Update**:
-   * **MongoDB Operation (Asset Update)**: Updates the parent `AssetManagement` record:
-     * **Fields Updated**: Recalculates `remainingTokens` (numberOfTokens - total invested tokens), `progressBar` percentage.
-     * **Asset Status Toggle**: Sets `assetStatus` to `Closing Soon` if progress exceeds 70%, or `Closed` if progress equals 100% (which also toggles `isInvestmentClosed: true`).
-   * **Cache Invalidation**: Invalidates cache keys `admin:asset-investment:*` and `asset_list:*` using `CacheService`.
-   * **Completion Emails**: Dispatches the finalized PDF agreement link to both investor and creator. If progress hit 100%, completion emails are dispatched to all active token holders.
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `investordeleteds` | `investorId` | ObjectId | Insert | Linked profile identifier. |
+| **RWA DB** | `investordeleteds` | `email` | String | Insert | Account email to flag. |
+| **RWA DB** | `investordeleteds` | `reason` | String | Insert | Deletion reasoning statement. |
+| **RWA DB** | `investordeleteds` | `status` | String | Insert | Initialized status: `"pending"`. |
 
 ---
 
-### 3.2 RWA Asset Completion Flow
+### 1.8 Investment Creation
+Initializes a real world asset tokenization purchase commitment.
 
-When an asset matures or is liquidated, the contract emits a completion event, triggering profit calculations and status updates.
+#### Database Operations & State Lifecycle
+1. **Asset Details Verification (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetmanagements`
+   * **Operation**: Read (`findById`)
+   * **Key Fields Read**:
+     * `_id` (assetId): Confirms target listing registry.
+     * `holdingPeriod`: Loaded to register lock duration.
+     * `pricePerToken` / `numberOfTokens` / `remainingTokens`: Loaded to verify availability and calculate shares.
+     * `assetManagementStatus`: Verified to ensure the status is `2` (Approved).
+2. **Investment Record Registration (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetinvestments`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `investorId`: Local investor reference.
+     * `assetId`: Target asset reference.
+     * `amountInvested`: Net investment amount.
+     * `transactionFee`: Stored calculated service fee.
+     * `sharedQuantity`: Count of RWA security tokens purchased.
+     * `status`: Hardcoded to `"pending"`.
+     * `isInvestorAgreed`: Set to `true`.
+     * `investorAgreementDate`: Current date timestamp.
+     * `holdingPeriod`: Copied from asset.
+3. **Mutual Agreement Registration (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetinvestmentdocuments`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `assetInvestmentId`: Linked investment reference.
+     * `documentUrl`: Stores the AWS S3 URL to the generated PDF contract.
+     * `documentType`: Hardcoded to `"mutual-agreement"`.
+     * `investorSignatureUrl`: S3 link storing the png signature image.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Listener as Listener Service
-    participant RWA as RWA Backend
-    participant DB as MongoDB (RWA DB)
-    participant Email as Email Queue (Redis)
-
-    Note over Listener: Asset maturity reached on-chain
-    Note over Listener: Contract completes asset and calculates yields
-    Note over Listener: Emit Event: AssetCompleted(propertyId, profitGenerated, finalAmount, investorsProfit[])
-    
-    Listener->>RWA: POST /listeners/asset-completed (propertyId, profitGenerated, finalAmount, investorsProfit[])
-    RWA->>DB: findOne({ propertyId }) (Read Asset)
-    
-    loop For each investor in investorsProfit
-        RWA->>DB: findOne({ walletAddress })
-        RWA->>DB: find({ assetId, investorId, status: "approved" })
-        Note over RWA: Calculate investor profit percentages
-        RWA->>DB: updateMany({ investments }, { maturityEmailSent: true, profitAmount, profitPercentage, maturityDate: now })
-        RWA->>Email: Queue "investment-maturity" Email
-    end
-    
-    RWA->>DB: findOneAndUpdate(AssetManagementComplete { profitGenerated, assetFinalAmount }, { upsert: true })
-    RWA->>DB: findByIdAndUpdate(AssetManagement { assetStatus: "Closed", assetCompletionStatus: 1 })
-    RWA-->>Listener: HTTP 200 OK (Matured Status persisted)
-```
-
-#### Detailed Operations & Mappings
-1. **Event Parsing**:
-   * **EVM Event**: `AssetCompleted` contains `propertyId`, `profitGenerated`, `finalAmount`, and an array `investorsProfit` (mapping investor addresses to individual token earnings).
-   * **API Target**: `POST /api/v1/listeners/asset-completed` (Controller: `ListenersController.assetMarkAsCompleted`).
-   * **DTO**: `AssetCompletedDto`.
-2. **Maturity Loop**:
-   * For each wallet in `investorsProfit`:
-     * Finds investor record matching the address.
-     * Finds all `approved` investments for that investor in the target asset where `maturityEmailSent` is not true.
-     * **Calculations**:
-       * `investorProfitAmount` = on-chain profit / 1e6 (USDC decimal conversion).
-       * `investorProfitPercentage` = `(investorProfitAmount / totalInvestmentAmount) * 100`.
-     * **MongoDB Operation (Investment Update)**:
-       * **Fields Updated**: `maturityEmailSent` -> `true`, `profitAmount`, `profitPercentage`, `maturityDate` -> current date.
-     * **Notification**: Enqueues `investment-maturity` email alert to Redis.
-3. **Database Insertion (Maturity Ledger)**:
-   * **MongoDB Operation**: `findOneAndUpdate` on `AssetManagementComplete` collection matching `{ assetId }` with `{ upsert: true }`.
-   * **Fields Populated**: `profitGenerated` (converted to USDC decimals), `assetFinalAmount`, `assetCompletionDate` -> current date.
-4. **Asset State Update**:
-   * **MongoDB Operation**: `findByIdAndUpdate` on `AssetManagement` collection.
-   * **Fields Updated**: `assetStatus` -> `Closed`, `assetCompletionStatus` -> `1`.
-   * **Notification**: Sends `AssetCompletionApproval` confirmation email to the asset's original creator.
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `assetmanagements` | `_id` | ObjectId | Read Match | Target asset identifier. |
+| **RWA DB** | `assetmanagements` | `assetManagementStatus`| Number | Read | Checks that asset is `2` (Approved). |
+| **RWA DB** | `assetinvestments` | `investorId` | ObjectId | Insert | Linked investor ID. |
+| **RWA DB** | `assetinvestments` | `assetId` | ObjectId | Insert | Linked asset ID. |
+| **RWA DB** | `assetinvestments` | `amountInvested` | Number | Insert | Net investment volume. |
+| **RWA DB** | `assetinvestments` | `sharedQuantity` | Number | Insert | Count of security tokens. |
+| **RWA DB** | `assetinvestments` | `status` | String | Insert | Initialized status: `"pending"`. |
+| **RWA DB** | `assetinvestments` | `isInvestorAgreed` | Boolean | Insert | Set to `true`. |
+| **RWA DB** | `assetinvestmentdocuments` | `assetInvestmentId` | ObjectId | Insert | Associated investment ID. |
+| **RWA DB** | `assetinvestmentdocuments` | `documentUrl` | String | Insert | Mutual agreement contract link. |
 
 ---
 
-### 3.3 RWA Buyback Flow
+### 1.9 Investment Approval (`InvestmentApproved` event)
+Triggers when the administrator completes transaction registration on-chain, updating ownership variables and decreasing available asset token pools. The blockchain event is parsed by the stateless contract listener and forwarded to the core database backend.
 
-The buyback workflow allows creators/listers to repurchase tokens from investors under supervised parameters.
+#### Database Operations & State Lifecycle
+1. **On-Chain Event Detection**:
+   * The stateless **`nrx-rwa-contract-backend`** listener monitors the blockchain.
+   * On detecting `InvestmentApproved`, it extracts `investorAddress`, `assetAddress`, `sharedQuantity`, `investmentId`, and `maturityPeriod` and sends an HMAC-SHA256 callback to the core backend.
+2. **Investment Verification & Approval (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetinvestments`
+   * **Operation**: Read & Update (`findOneAndUpdate`)
+   * **Key Fields Read**:
+     * `assetId` (matched via `assetAddress`), `investorId` (matched via `investorAddress`), `sharedQuantity`, `isInvestorAgreed: true`, and verifies `transactionHash` is empty.
+   * **Key Fields Updated**:
+     * `status`: Transitions from `"pending"` to `"approved"`.
+     * `transactionHash`: Stores the transaction hash confirming on-chain registration.
+     * `maturityDate`: Derived and stored from the block's `maturityPeriod`.
+     * `investmentId`: Stores the on-chain index ID.
+     * `ownershipPercentage`: Calculated and saved (`[amountInvested / (pricePerToken * numberOfTokens)] * 100`).
+3. **Asset Allocation Updates (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetmanagements`
+   * **Operation**: Update (`updateOne`) matching the parent asset.
+   * **Key Fields Updated**:
+     * `remainingTokens`: Decreased by the purchased `sharedQuantity`.
+     * `progressBar`: Recalculated and updated percentage.
+     * `assetStatus`: Toggles to `"Closing Soon"` (> 70%) or `"Closed"` (100%).
+     * `isInvestmentClosed`: Set to `true` if remaining tokens hit `0`.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Investor as Client Browser
-    participant RWA as RWA Backend
-    participant DB as MongoDB (RWA DB)
-    participant Listener as Listener Service
-    participant Contract as Smart Contract (EVM)
-
-    Investor->>RWA: POST /withdrawal-request/:investmentId (withdrawalRequestedAmount)
-    RWA->>DB: findById(investmentId) (Check ownership)
-    RWA->>DB: updateOne({ investmentId }, { withdrawalRequestedAmount, withdrawalStatus: "requested" })
-    RWA-->>Investor: HTTP 200 OK (Requested State)
-    
-    Note over Investor: Investor requests Buyback transaction on-chain
-    Note over Contract: Emit Event: BuyBackRequested(investmentId, requestId, requestedPrice, propertyId, shareholder)
-    
-    Listener->>Contract: Detects BuyBackRequested
-    Listener->>RWA: POST /listeners/buy-back/requested (investmentId, requestId, requestedPrice, propertyId, shareholder)
-    RWA->>DB: findOne({ propertyId }) (Read Asset)
-    RWA->>DB: findOne({ walletAddress: shareholder })
-    RWA->>DB: findOne({ investmentId: investmentIdNumber, status: "approved" })
-    RWA->>DB: updateOne({ _id: investmentId }, { withdrawalRequestId, withdrawalRequestedAmount, withdrawalStatus: "requested" })
-    Note over RWA: Send request emails to Creator & Admins
-    
-    Note over Contract: Admin approves Buyback transaction on-chain
-    Note over Contract: Emit Event: BuyBackApproved(propertyId, shareholder, requestId, price)
-    
-    Listener->>Contract: Detects BuyBackApproved
-    Listener->>RWA: POST /listeners/buy-back/approved (propertyId, shareholder, requestId, price)
-    RWA->>DB: findOne({ withdrawalRequestId: requestId })
-    RWA->>DB: updateOne({ investmentId }, { withdrawalStatus: "approved", status: "completed", withdrawalAmount: price, ownershipPercentage: 0 })
-    RWA->>DB: updateMany(AssetYieldManagement { status: "completed", isWithdrawn: true })
-    Note over RWA: Send Buyback Request Approved Email to Investor
-```
-
-#### Detailed Operations & Mappings
-1. **Creation**:
-   * **Endpoint**: `POST /api/v1/investor/asset-investment/withdrawal-request/:investmentId` (Controller: `AssetInvestmentController.withdrawalRequest`)
-   * **DTO**: `WithdrawalRequestDto` (`withdrawalRequestedAmount`).
-   * **MongoDB Operation**: Performs `findById` on `assetinvestments` to confirm the asset belongs to the requesting investor.
-   * **Fields Updated**: `withdrawalRequestedAmount`, `withdrawalStatus` -> `requested`.
-2. **Blockchain Request Notification**:
-   * **Blockchain Event `BuyBackRequested`**: Emitted when the investor locks their tokens for redemption.
-   * **API Target**: `POST /api/v1/listeners/buy-back/requested` (Controller: `ListenersController.buyBackRequested`).
-   * **DTO**: `BuyBackRequestedDto` (`investmentId`, `requestId`, `requestedPrice`, `propertyId`, `shareholder`).
-   * **Conversion**: `requestedPrice` is converted from blockchain format by dividing by 1e6 (USDC decimals).
-   * **MongoDB Operation**: Checks `AssetManagement` (matching `propertyId`), `Investor` (matching `shareholder`), and `AssetInvestment` (matching `investmentId` and `status: approved`).
-   * **Fields Updated**: `withdrawalRequestId` -> `requestId`, `withdrawalRequestedAmount` -> `requestedPrice` (converted), `withdrawalStatus` -> `requested`.
-   * **Notification**: Sends withdrawal request notification emails to listers and platform administrators.
-3. **Blockchain Approval Execution**:
-   * **Blockchain Event `BuyBackApproved`**: Emitted when the administrator completes the buyback transaction on-chain.
-   * **API Target**: `POST /api/v1/listeners/buy-back/approved` (Controller: `ListenersController.buyBackApproved`).
-   * **DTO**: `BuyBackApprovedDto` (`propertyId`, `shareholder`, `requestId`, `price`).
-   * **MongoDB Lookup**: Finds `AssetInvestment` matching the `withdrawalRequestId`.
-   * **Validation**: Validates that the approved `price` (converted from on-chain decimals) matches the stored `withdrawalRequestedAmount`.
-   * **MongoDB Operation (Investment Update)**:
-     * **Fields Updated**: `withdrawalStatus` -> `approved`, `status` -> `completed`, `withdrawalAmount` -> approved price, `ownershipPercentage` -> `0` (indicating the investor no longer holds active security shares).
-   * **MongoDB Operation (Yield Updates)**:
-     * **Fields Updated**: `status` -> `completed`, `isWithdrawn` -> `true` on the associated `AssetYieldManagement` collection records to close out historical unclaimed rental earnings.
-   * **Notification**: Sends a confirmation email to the investor.
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `assetinvestments` | `status` | String | Update | Transitions to `"approved"`. |
+| **RWA DB** | `assetinvestments` | `transactionHash` | String | Update | On-chain verification tx hash. |
+| **RWA DB** | `assetinvestments` | `maturityDate` | Date / Number | Update | Sets mature date timestamp. |
+| **RWA DB** | `assetinvestments` | `investmentId` | Number | Update | On-chain index identifier. |
+| **RWA DB** | `assetinvestments` | `ownershipPercentage`| Number | Update | Calculated share weight. |
+| **RWA DB** | `assetmanagements` | `remainingTokens` | Number | Update | Deducts purchased quantities. |
+| **RWA DB** | `assetmanagements` | `progressBar` | Number | Update | Recalculates funding progress. |
+| **RWA DB** | `assetmanagements` | `assetStatus` | String | Update | Set to `"Closing Soon"` or `"Closed"`. |
 
 ---
 
-## 4. Infrastructure & Event Listening
+### 1.10 Asset Completion Event (`AssetCompleted`)
+Triggers when the asset completes/matures on-chain. The event is captured by the stateless listener, which computes the final payouts and forwards them to the core database backend.
 
-### 4.1 RWA Blockchain Listener & Checkpoint Flow
+#### Database Operations & State Lifecycle
+1. **Investment Profit updates (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetinvestments`
+   * **Operation**: Read & Update (`updateMany` looping through the payout array)
+   * **Key Fields Read**:
+     * Locates all `approved` investments under the target `assetId` where `maturityEmailSent` is not true.
+   * **Key Fields Updated**:
+     * `maturityEmailSent`: Set to `true`.
+     * `profitAmount`: Stored allocated profit (on-chain profit / 1e6 USDC scale).
+     * `profitPercentage`: Stored yield return percentage.
+     * `maturityDate`: Sets final date to current timestamp.
 
-The RWA platform uses a stateless listener `nrx-rwa-contract-backend` to monitor blockchain events, process them sequentially via `nrx-rwa-backend`, and persist progress via checkpoints.
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `assetinvestments` | `maturityEmailSent` | Boolean | Update | Set to `true`. |
+| **RWA DB** | `assetinvestments` | `profitAmount` | Number | Update | Stored yield profit. |
+| **RWA DB** | `assetinvestments` | `profitPercentage` | Number | Update | Stored yield rate. |
+| **RWA DB** | `assetinvestments` | `maturityDate` | Date | Update | Overwrites with final mature date. |
 
-```mermaid
-flowchart TD
-    subgraph EVM Chain
-        Event[Contract Event Emitted]
-    end
+---
 
-    subgraph Stateless RWA Contract Listener
-        Listen[BaseListener Service] -->|Intercepts Event| Parse[Extract eventData & blockNumber]
-        Parse -->|Sign HMAC Header| HTTPPost[HTTP POST API Call]
-    end
+### 1.11 Buyback Request (`BuyBackRequested` event)
+Allows investors to submit withdrawal/liquidation requests to creators.
 
-    subgraph Core RWA Business Backend
-        HTTPPost -->|Arrives at Controller| CheckConflict{HTTP 200 or 500?}
-        
-        CheckConflict -->|500 Server Error| Queue[Durable Queue Service]
-        Queue -->|Enqueue MongoDB| QueueDB[(MongoDB Queue Collection)]
-        QueueDB -->|Cron Retries| HTTPPost
-        
-        CheckConflict -->|200 OK| Process[Execute Service logic & updates]
-        Process -->|Sync DB| CoreDB[(MongoDB Core Collections)]
-        
-        Process -->|Atomically Update Checkpoint| UpdateCheck[Update Checkpoint document]
-        UpdateCheck -->|$max: { blockNumber }| CheckpointDB[(listenerblockcheckpoints)]
-    end
+#### Database Operations & State Lifecycle
+1. **Request Registration (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetinvestments`
+   * **Operation**: Read & Update (`findOneAndUpdate` matching the unique on-chain `investmentId`)
+   * **Key Fields Read**:
+     * Confirms the investment belongs to the requesting investor.
+   * **Key Fields Updated**:
+     * `withdrawalStatus`: Set to `"requested"`.
+     * `withdrawalRequestedAmount`: Stored USDC price normalized from blockchain/input.
+     * `withdrawalRequestId`: Stored on-chain request ID.
 
-    Event -.-> Listen
-```
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `assetinvestments` | `investmentId` | Number | Read Match | Matches target on-chain ID. |
+| **RWA DB** | `assetinvestments` | `withdrawalStatus`| String | Update | Set to `"requested"`. |
+| **RWA DB** | `assetinvestments` | `withdrawalRequestedAmount`| Number | Update | Stored liquidating valuation. |
+| **RWA DB** | `assetinvestments` | `withdrawalRequestId`| Number | Update | On-chain buyback ID. |
 
-#### Detailed Operations & Mappings
-1. **Stateless Event Processing**:
-   * The listener backend `nrx-rwa-contract-backend` monitors EVM contract events.
-   * It extracts `eventData`, `transactionHash`, and `blockNumber` and posts it to the core RWA backend using HMAC-SHA256 headers.
-2. **Durable Queuing & Error Resilience**:
-   * If `nrx-rwa-backend` returns an error, the payload is captured by the `DurableQueueService` and written to the local `durablequeues` collection for cron retry.
-3. **Monotonic Checkpoint Updates**:
-   * The checkpoint collection `listenerblockcheckpoints` is updated atomically using a `$max` query on the `blockNumber`.
-4. **WebSocket Replay Recovery**:
-   * On reconnection, the listener retrieves the stored checkpoint block from `nrx-rwa-backend` and queries historical blocks to bridge the downtime gap.
+---
+
+### 1.12 Buyback Approval (`BuyBackApproved` event)
+Triggers when the administrator completes the buyback transaction on-chain. The event is processed by the stateless listener and pushed to the core backend.
+
+#### Database Operations & State Lifecycle
+1. **Investment Closure (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetinvestments`
+   * **Operation**: Update (`updateOne`) matching the `withdrawalRequestId`.
+   * **Key Fields Updated**:
+     * `withdrawalStatus`: Transitions to `"approved"`.
+     * `status`: Transitions to `"completed"`.
+     * `withdrawalAmount`: Final payout price.
+     * `ownershipPercentage`: Set to `0` (investor no longer holds active security shares).
+2. **Historical Yield Termination (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetyieldmanagements`
+   * **Operation**: Update (`updateMany`) matching the investor's yields.
+   * **Key Fields Updated**:
+     * `status`: Transitions to `"completed"`.
+     * `isWithdrawn`: Set to `true` (forces closure on historical unclaimed rental payouts for this investment).
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `assetinvestments` | `withdrawalStatus`| String | Update | Transitions to `"approved"`. |
+| **RWA DB** | `assetinvestments` | `status` | String | Update | Transitions to `"completed"`. |
+| **RWA DB** | `assetinvestments` | `withdrawalAmount`| Number | Update | Final paid output. |
+| **RWA DB** | `assetinvestments` | `ownershipPercentage`| Number | Update | Reset to `0`. |
+| **RWA DB** | `assetyieldmanagements` | `status` | String | Update | Transitions to `"completed"`. |
+| **RWA DB** | `assetyieldmanagements` | `isWithdrawn` | Boolean | Update | Forced to `true`. |
+
+---
+
+### 1.13 Yield Claim / Withdrawal Event (`/asset-withdrawal`)
+Authenticates rental yield payouts.
+
+#### Database Operations & State Lifecycle
+1. **Yield Payout Updates (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetyieldmanagements`
+   * **Operation**: Update (`updateOne`)
+   * **Key Fields Updated**:
+     * `isWithdrawn`: Updated to `true` on the targeted rental yield record.
+     * `status`: Updated to `"completed"`.
+     * `transactionHash`: Stores the payout transaction hash.
+2. **Withdrawal Audit Log Registration (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetyieldmanagements`
+   * **Operation**: Upsert (`findOneAndUpdate` with `{ upsert: true }`)
+   * **Key Fields Stored**:
+     * Creates an accompanying audit log with `yieldType` set to `"withdraw"` and `netAmount` set to the payout size.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `assetyieldmanagements` | `isWithdrawn` | Boolean | Update | Set to `true` on claim. |
+| **RWA DB** | `assetyieldmanagements` | `status` | String | Update | Transitions to `"completed"`. |
+| **RWA DB** | `assetyieldmanagements` | `transactionHash`| String | Update | Payout tx hash. |
+| **RWA DB** | `assetyieldmanagements` | `yieldType` | String | Insert (Audit) | Set to `"withdraw"`. |
+| **RWA DB** | `assetyieldmanagements` | `netAmount` | Number | Insert (Audit) | Yield payout volume. |
+
+---
+
+### 1.14 Dividend Claiming Flow
+Allows investors to retrieve distributed dividend payouts.
+
+#### Database Operations & State Lifecycle
+1. **Dividend Retrieval (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `dividendfundmanagements`
+   * **Operation**: Update (`updateOne`) matching dividend `_id`.
+   * **Key Fields Updated**:
+     * `status`: Set to `"completed"`.
+     * `transactionHash`: Stored payout verification hash.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `dividendfundmanagements` | `status` | String | Update | Transitions to `"completed"`. |
+| **RWA DB** | `dividendfundmanagements` | `transactionHash`| String | Update | On-chain claim verification hash. |
+
+---
+
+## 2. Actor: Creator (Asset Owner) Flows
+
+### 2.1 Creator Registration
+Creates profiles directly in the local RWA DB to list real world assets.
+
+#### Database Operations & State Lifecycle
+1. **Duplicate Account Check (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `users`
+   * **Operation**: Read (`findOne`) matching the email.
+2. **Account Creation (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `users`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `userName`: Stored creator username handle.
+     * `email`: Login email.
+     * `password`: Hashed bcrypt password.
+     * `status`: Hardcoded to `1` (Active).
+     * `nonce`: Set to `0`.
+     * `twoFaEnabled`: Hardcoded to `false` on registration.
+     * `KYCVerified` / `AdminVerified`: Set to `0` (unverified).
+     * `isCrypto`: Set to `false`.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `users` | `userName` | String | Insert | Display handle. |
+| **RWA DB** | `users` | `email` | String | Insert / Read | Unique login identifier. |
+| **RWA DB** | `users` | `password` | String | Insert | Bcrypt hashed credentials. |
+| **RWA DB** | `users` | `status` | Number | Insert | Set to `1` (active) on registration. |
+| **RWA DB** | `users` | `nonce` | Number | Insert | Set to `0`. |
+| **RWA DB** | `users` | `twoFaEnabled` | Boolean | Insert | Set to `false`. |
+
+---
+
+### 2.2 Creator Login & 2FA Flow
+Authenticating creator accounts locally.
+
+#### Database Operations & State Lifecycle
+1. **Credentials Validation (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `users`
+   * **Operation**: Read & Update (`findOneAndUpdate`)
+   * **Key Fields Read**:
+     * `email`: Query criteria.
+     * `password`: Loaded to compare bcrypt hash.
+     * `twoFaEnabled`: Checked to verify if 2FA is active.
+   * **Key Fields Updated (If 2FA is active)**:
+     * `tempToken` / `tempTokenExpiresAt`: Populates verification session fields.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `users` | `email` | String | Read Match | Filters target account. |
+| **RWA DB** | `users` | `password` | String | Read | bcrypt hashed password. |
+| **RWA DB** | `users` | `twoFaEnabled` | Boolean | Read | Checks Multi-Factor status. |
+| **RWA DB** | `users` | `tempToken` | String | Update | Ephemeral session token. |
+
+---
+
+### 2.3 SIWE Wallet Connection Flow
+Validates ownership of creator decentralized addresses.
+
+#### Database Operations & State Lifecycle
+1. **Local Wallet Registration (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `users`
+   * **Operation**: Update (`updateOne`)
+   * **Key Fields Updated**:
+     * `walletAddress`: Stores the normalized lowercase Ethereum address.
+     * `walletNonce` / `walletNonceExpiresAt`: Cleared/unset.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `users` | `walletAddress` | String | Update | lowercase Ethereum address. |
+| **RWA DB** | `users` | `walletNonce` | String | Unset | Clears nonce. |
+
+---
+
+### 2.4 Profile Settings Update
+Allows creators to customize contact and geolocation data.
+
+#### Database Operations & State Lifecycle
+1. **Creator Contact Settings Update (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `users`
+   * **Operation**: Update (`updateOne`) matching user `_id`.
+   * **Key Fields Updated**:
+     * `phoneNumber`: User contact telephone string.
+     * `address`: Resident street address.
+     * `city`: Resident city.
+     * `country`: Resident country.
+     * `postalCode`: Resident area zip code.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `users` | `phoneNumber` | String | Update | Creator's phone number. |
+| **RWA DB** | `users` | `address` | String | Update | Resident street details. |
+| **RWA DB** | `users` | `city` | String | Update | Geolocation city. |
+| **RWA DB** | `users` | `country` | String | Update | Geolocation country. |
+| **RWA DB** | `users` | `postalCode` | String | Update | Geolocation postal/zip code. |
+
+---
+
+### 2.5 Contact Support Request
+Allows creators to log troubleshooting issues.
+
+#### Database Operations & State Lifecycle
+1. **Support Ticket Registration (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `usercontactsupports`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `userId`: Reference link to local creator profile.
+     * `name` & `email`: Contact details.
+     * `subject` & `message`: Issue content.
+     * `status`: Set to `"pending"`.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `usercontactsupports` | `userId` | ObjectId | Insert | Creator link index. |
+| **RWA DB** | `usercontactsupports` | `name` | String | Insert | Customer name. |
+| **RWA DB** | `usercontactsupports` | `email` | String | Insert | Contact email. |
+| **RWA DB** | `usercontactsupports` | `subject` | String | Insert | Support subject. |
+| **RWA DB** | `usercontactsupports` | `message` | String | Insert | Support description details. |
+| **RWA DB** | `usercontactsupports` | `status` | String | Insert | Set to `"pending"`. |
+
+---
+
+### 2.6 Account Deletion Request
+Permits creators to trigger soft-deletion queues.
+
+#### Database Operations & State Lifecycle
+1. **Compliance Deletion Entry (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `userdeleteds`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `userId`: Reference link to local creator profile.
+     * `email`: Stored email address.
+     * `reason`: Explanation text.
+     * `status`: Set to `"pending"`.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `userdeleteds` | `userId` | ObjectId | Insert | Creator link index. |
+| **RWA DB** | `userdeleteds` | `email` | String | Insert | Account email. |
+| **RWA DB** | `userdeleteds` | `reason` | String | Insert | Deletion reasoning statement. |
+| **RWA DB** | `userdeleteds` | `status` | String | Insert | Set to `"pending"`. |
+
+---
+
+### 2.7 Asset Registration (Listing Creation)
+Allows creators to register tokenizable real world asset drafts.
+
+#### Database Operations & State Lifecycle
+1. **Asset Registry Creation (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetmanagements`
+   * **Operation**: Insert (`insertOne`)
+   * **Key Fields Stored**:
+     * `creatorId`: Local creator ObjectId link.
+     * `categoryName`: Categorization code (`"Art"`, `"Mine"`, `"Agro"`, `"Ai"`, `"Realty"`, `"Energy"`).
+     * `assetManagementStatus`: Initialized to `0` (Draft).
+     * `progressBar`: Set to `0`.
+     * `remainingTokens`: Set to maximum asset token pool.
+     * `basicInformation`: Nested category metadata objects containing basic project info, technical details, compliance certifications, and financial specifications.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `assetmanagements` | `creatorId` | ObjectId | Insert | Creator profile link. |
+| **RWA DB** | `assetmanagements` | `categoryName` | String | Insert | Category code. |
+| **RWA DB** | `assetmanagements` | `assetManagementStatus`| Number | Insert | Set to `0` (Draft). |
+| **RWA DB** | `assetmanagements` | `progressBar` | Number | Insert | Set to `0`. |
+| **RWA DB** | `assetmanagements` | `remainingTokens` | Number | Insert | Set to total pool capacity. |
+| **RWA DB** | `assetmanagements` | `basicInformation` | Object | Insert | Contains project and compliance specifications. |
+
+---
+
+## 3. Actor: Admin Flows
+
+### 3.1 Admin Login & 2FA Flow
+Authenticating administrators.
+
+#### Database Operations & State Lifecycle
+1. **Credentials Validation (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `admins`
+   * **Operation**: Read (`findOne`) matching the email.
+   * **Key Fields Read**:
+     * `email`, `password`, `twoFactorEnabled`, `twoFactorSecret`.
+2. **Session Registration (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `admins`
+   * **Operation**: Update (`updateOne`)
+   * **Key Fields Updated**:
+     * `lastLoginAt`: Updates to current timestamp.
+     * `jwtTokens`: Appends the newly issued session JWT.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `admins` | `email` | String | Read Match | Target matching login email. |
+| **RWA DB** | `admins` | `password` | String | Read | bcrypt hashed password. |
+| **RWA DB** | `admins` | `twoFactorEnabled` | Boolean | Read | Checks Multi-Factor status. |
+| **RWA DB** | `admins` | `twoFactorSecret` | String | Read | TOTP secret validation key. |
+| **RWA DB** | `admins` | `lastLoginAt` | Date | Update | Timestamp of last access. |
+| **RWA DB** | `admins` | `jwtTokens` | Array | Update | Appends active session token. |
+
+---
+
+### 3.2 Admin Wallet Authentication Flow (SIWE)
+Administrators authenticate via cryptographic signatures.
+
+#### Database Operations & State Lifecycle
+1. **SIWE Verification & Session Check (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `admins`
+   * **Operation**: Read & Update (`findOneAndUpdate`) matching `walletAddress` (normalized lowercase).
+   * **Key Fields Read**:
+     * `walletNonce`, `walletNonceExpiresAt`.
+   * **Key Fields Updated**:
+     * `walletNonce` / `walletNonceExpiresAt`: `$unset` or cleared.
+     * `jwtTokens`: Appends the active session JWT.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `admins` | `walletNonce` | String | Update / Unset | Challenge connection nonce. |
+| **RWA DB** | `admins` | `walletNonceExpiresAt`| Date | Update / Unset | Nonce active window. |
+| **RWA DB** | `admins` | `walletAddress` | String | Read Match | lowercase Ethereum address. |
+| **RWA DB** | `admins` | `jwtTokens` | Array | Update | Appends active session token. |
+
+---
+
+### 3.3 Resolve Support Tickets
+Allows admins to resolve tickets filed by Investors or Creators.
+
+#### Database Operations & State Lifecycle
+1. **Investor Ticket Resolution (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `investorcontactsupports`
+   * **Operation**: Update (`updateOne`)
+   * **Key Fields Updated**:
+     * `status`: Set to `"resolved"`.
+     * `adminNote` & `resolvedAt`.
+2. **Creator Ticket Resolution (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `usercontactsupports`
+   * **Operation**: Update (`updateOne`)
+   * **Key Fields Updated**:
+     * `status`: Set to `"resolved"`.
+     * `adminNote` & `resolvedAt`.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `investorcontactsupports` | `status` | String | Update | Set to `"resolved"`. |
+| **RWA DB** | `investorcontactsupports` | `adminNote` | String | Update | Resolution comments. |
+| **RWA DB** | `investorcontactsupports` | `resolvedAt` | Date | Update | Resolve timestamp. |
+| **RWA DB** | `usercontactsupports` | `status` | String | Update | Set to `"resolved"`. |
+| **RWA DB** | `usercontactsupports` | `adminNote` | String | Update | Resolution comments. |
+| **RWA DB** | `usercontactsupports` | `resolvedAt` | Date | Update | Resolve timestamp. |
+
+---
+
+### 3.4 Approve Compliance Account Deletion
+Allows admins to delete profiles filed by Investors or Creators.
+
+#### Database Operations & State Lifecycle
+1. **Investor Deletion Approval (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `investordeleteds` ➔ Update `status` to `"deleted"`, `deletedAt` to current timestamp.
+   * **Collection**: `investors` ➔ Update status to `0` (Suspended).
+2. **Creator Deletion Approval (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `userdeleteds` ➔ Update `status` to `"deleted"`, `deletedAt` to current timestamp.
+   * **Collection**: `users` ➔ Update status to `0` (Suspended).
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `investordeleteds` | `status` | String | Update | Transitions to `"deleted"`. |
+| **RWA DB** | `investordeleteds` | `deletedAt` | Date | Update | Processed timestamp. |
+| **RWA DB** | `investors` | `status` | Number | Update | Sets profile status to `0` (Disabled). |
+| **RWA DB** | `userdeleteds` | `status` | String | Update | Transitions to `"deleted"`. |
+| **RWA DB** | `userdeleteds` | `deletedAt` | Date | Update | Processed timestamp. |
+| **RWA DB** | `users` | `status` | Number | Update | Sets creator status to `0` (Disabled). |
+
+---
+
+### 3.5 Asset Listing Approval
+Administrators review creator drafts and approve them for active listing, generating security token targets.
+
+#### Database Operations & State Lifecycle
+1. **Asset Listing Approval (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetmanagements`
+   * **Operation**: Update (`updateOne`) matching the target asset.
+   * **Key Fields Updated**:
+     * `AdminId`: Approving admin ObjectId.
+     * `assetManagementStatus`: Set to `2` (Approved/Listed).
+     * `securityToken`: Stores the deployed contract address representing the asset on-chain.
+     * `transactionHash`: Deployment contract hash.
+     * `assetStatus`: Initialized to `"On Going"`.
+2. **Asset Listing Rejection (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetmanagements`
+   * **Operation**: Update (`updateOne`)
+   * **Key Fields Updated**:
+     * `AdminId`: Rejecting admin ObjectId.
+     * `assetManagementStatus`: Set to `3` (Rejected).
+     * `rejectedReason`: Stored explanation string.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `assetmanagements` | `AdminId` | ObjectId | Update | Approving admin reference. |
+| **RWA DB** | `assetmanagements` | `assetManagementStatus`| Number | Update | Set to `2` (Approved) or `3` (Rejected). |
+| **RWA DB** | `assetmanagements` | `securityToken` | String | Update | Deployed smart contract address. |
+| **RWA DB** | `assetmanagements` | `transactionHash` | String | Update | Deploy contract tx hash. |
+| **RWA DB** | `assetmanagements` | `assetStatus` | String | Update | Initialized status: `"On Going"`. |
+| **RWA DB** | `assetmanagements` | `rejectedReason` | String | Update | Reason detail (if status `3`). |
+
+---
+
+### 3.6 Asset Completion Ledger Creation (`AssetCompleted` event)
+Compiles final asset summaries upon maturity or liquidation.
+
+#### Database Operations & State Lifecycle
+1. **Asset Completion Ledger Upsert (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetmanagementcompletes`
+   * **Operation**: Upsert (`findOneAndUpdate` with `{ upsert: true }`)
+   * **Key Fields Stored**:
+     * `creatorId` / `assetId`: Target keys.
+     * `assetCompletionDate`: Set to current date.
+     * `assetFinalAmount`: Realized funding volume.
+     * `profitGenerated`: Total USDC yields generated by the asset.
+2. **Asset Status Update (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetmanagements`
+   * **Operation**: Update (`updateOne`)
+   * **Key Fields Updated**:
+     * `assetStatus`: Toggled to `"Closed"`.
+     * `assetCompletionStatus`: Set to `1` (Completed).
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `assetmanagementcompletes` | `creatorId` | ObjectId | Upsert Match | Creator reference link. |
+| **RWA DB** | `assetmanagementcompletes` | `assetId` | ObjectId | Upsert Match | Asset reference link. |
+| **RWA DB** | `assetmanagementcompletes` | `assetCompletionDate`| Date | Insert / Update | Completion date log. |
+| **RWA DB** | `assetmanagementcompletes` | `assetFinalAmount` | Number | Insert / Update | final funding sum. |
+| **RWA DB** | `assetmanagementcompletes` | `profitGenerated` | Number | Insert / Update | Generated profit volume. |
+| **RWA DB** | `assetmanagements` | `assetStatus` | String | Update | transitions to `"Closed"`. |
+| **RWA DB** | `assetmanagements` | `assetCompletionStatus`| Number | Update | Transitions to `1`. |
+
+---
+
+### 3.7 Rental Yield Allocation (`/asset-yield`)
+Allows administrators to distribute monthly yields to asset investors.
+
+#### Database Operations & State Lifecycle
+1. **Rental Yield Upsert (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `assetyieldmanagements`
+   * **Operation**: Upsert (`findOneAndUpdate` with `{ upsert: true }`)
+   * **Key Fields Stored**:
+     * Compound Unique Filter: `{ AssetId, investerId, yieldYear, yieldMonth, yieldType: "rental" }`.
+     * `netAmount`: Stored USDC yield payout value.
+     * `netAmountDecimals`: Stored decimals representation.
+     * `sharesHolding`: Stored share weight at generation time.
+     * `yieldDay`: Stored day index.
+     * `status`: Set to `"pending"`.
+     * `isYieldClosed`: Set to `false`.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `assetyieldmanagements` | `AssetId` | ObjectId | Upsert Match | Matches target asset. |
+| **RWA DB** | `assetyieldmanagements` | `investerId` | ObjectId | Upsert Match | Matches target investor. |
+| **RWA DB** | `assetyieldmanagements` | `yieldYear` | Number | Upsert Match | Distribution calendar year. |
+| **RWA DB** | `assetyieldmanagements` | `yieldMonth` | Number | Upsert Match | Distribution calendar month. |
+| **RWA DB** | `assetyieldmanagements` | `yieldType` | String | Upsert Match | Filter set to `"rental"`. |
+| **RWA DB** | `assetyieldmanagements` | `netAmount` | Number | Insert / Update | Yield allocation volume. |
+| **RWA DB** | `assetyieldmanagements` | `sharesHolding` | Number | Insert / Update | Token balance at distribution time. |
+| **RWA DB** | `assetyieldmanagements` | `status` | String | Insert | Set to `"pending"`. |
+| **RWA DB** | `assetyieldmanagements` | `isYieldClosed` | Boolean | Insert | Set to `false`. |
+
+---
+
+### 3.8 Admin Dividend Distribution Setup
+Allows administrators to configure and distribute dividend rewards.
+
+#### Database Operations & State Lifecycle
+1. **Dividend Distribution Setup (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `dividendfundmanagements`
+   * **Operation**: Upsert (`findOneAndUpdate` with `{ upsert: true }` matching asset and investor keys)
+   * **Key Fields Stored**:
+     * `assetId` / `investorId`: Target identities.
+     * `dividendAmount`: Stored USDC dividend value.
+     * `dividendPercentage`: Stored dividend percentage.
+     * `payoutDate`: Planned dividend release timestamp.
+     * `status`: Set to `"pending"`.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `dividendfundmanagements` | `assetId` | ObjectId | Upsert Match | Target asset identifier. |
+| **RWA DB** | `dividendfundmanagements` | `investorId` | ObjectId | Upsert Match | Target investor identifier. |
+| **RWA DB** | `dividendfundmanagements` | `dividendAmount` | Number | Insert / Update | Distributed dividend capital. |
+| **RWA DB** | `dividendfundmanagements` | `dividendPercentage`| Number | Insert / Update | Dividend percentage yield weight. |
+| **RWA DB** | `dividendfundmanagements` | `payoutDate` | Date | Insert / Update | Planned payout date. |
+| **RWA DB** | `dividendfundmanagements` | `status` | String | Insert | Set to `"pending"`. |
+
+---
+
+### 3.9 Site Settings Configuration
+Maintains system variables.
+
+#### Database Operations & State Lifecycle
+1. **Configuration Registry Update (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `site_settings`
+   * **Operation**: Upsert (`findOneAndUpdate` matching global identity)
+   * **Key Fields Stored**:
+     * `maintenanceMode`: Boolean flag.
+     * `allowedCountries`: Array of geocodes allowed access.
+     * `feeStructure`: Net percentage transaction fee configurations.
+     * `adminId`: ObjectId of editing admin.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `site_settings` | `maintenanceMode` | Boolean | Upsert / Update | Platform maintenance flag. |
+| **RWA DB** | `site_settings` | `allowedCountries` | Array | Upsert / Update | Allowed ISO codes. |
+| **RWA DB** | `site_settings` | `feeStructure` | Object | Upsert / Update | Admin percentage settings. |
+| **RWA DB** | `site_settings` | `adminId` | ObjectId | Upsert / Update | Editing admin reference. |
+
+---
+
+### 3.10 Admin Panel Configuration
+Configures administrator workspace settings.
+
+#### Database Operations & State Lifecycle
+1. **Panel Preferences Update (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `adminsettings`
+   * **Operation**: Upsert (`findOneAndUpdate` matching global admin settings identity)
+   * **Key Fields Stored**:
+     * `themePreference`: Workspace display modes (e.g. `"dark"`, `"light"`).
+     * `notificationSettings`: Array of notification filters.
+     * `twoFactorConfig`: Boolean settings for enforcement.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `adminsettings` | `themePreference` | String | Upsert / Update | workspace visual theme choice. |
+| **RWA DB** | `adminsettings` | `notificationSettings`| Array | Upsert / Update | Alert notifications filters. |
+| **RWA DB** | `adminsettings` | `twoFactorConfig` | Boolean | Upsert / Update | Enforces MFA logins. |
+
+---
+
+### 3.11 Block Checkpoint Update
+Maintains the block pointer for stateless blockchain event listeners.
+
+#### Database Operations & State Lifecycle
+1. **Checkpoint Progress Commit (RWA DB)**:
+   * **Database**: Local Real World Asset Business Database
+   * **Collection**: `listenerblockcheckpoints`
+   * **Operation**: Update (`updateOne` using `$max`) matching `_id: "global"`.
+   * **Key Fields Updated**:
+     * `blockNumber`: Atomically advances to the highest parsed block number, preventing older event replays from moving the pointer backward.
+
+#### Collection Keys & Database Fields
+| Database | Collection | Key / Field | Type | Operation | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **RWA DB** | `listenerblockcheckpoints` | `_id` | String | Match | Filter set to `"global"`. |
+| **RWA DB** | `listenerblockcheckpoints` | `blockNumber` | Number | Update ($max) | Increments block height check pointer. |
